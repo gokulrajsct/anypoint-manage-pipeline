@@ -1,0 +1,46 @@
+# Desired state for "orders-api" in UAT. Missing instance -> promoted from TEST.
+apiInstance:
+  assetId: orders-api
+  groupId: null
+  assetVersion: "1.0.3"
+  productVersion: v1
+  instanceLabel: orders-api-uat
+  deploymentType: cloudhub2
+  endpoint:
+    implementationUri: https://orders-backend.uat.svc.example.com:8443/
+    type: http
+    scheme: https
+    port: 8081
+    path: /
+    withProxy: true
+    muleVersion4OrAbove: true
+
+promotion:
+  fromEnvironment: test
+  sourceInstanceLabel: orders-api-test
+  copyPolicies: false
+  copyTiers: true
+  copyAlerts: false
+
+prune: true
+
+policies:
+  - assetId: rate-limiting-sla
+    groupId: 68ef9520-24e9-4cf2-b2f5-620025690913
+    version: "1.4.0"
+    order: 1
+    configurationData:
+      clusterizable: true
+      exposeHeaders: true
+      rateLimits:
+        - maximumRequests: 400
+          timePeriodInMilliseconds: 60000
+
+  - assetId: client-id-enforcement
+    groupId: 68ef9520-24e9-4cf2-b2f5-620025690913
+    version: "1.3.2"
+    order: 2
+    configurationData:
+      credentialsOrigin: customExpression
+      clientIdExpression: "#[attributes.headers['client_id']]"
+      clientSecretExpression: "#[attributes.headers['client_secret']]"

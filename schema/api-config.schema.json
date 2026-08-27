@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/anypoint-manage-pipeline/api-config.schema.json",
+  "title": "Anypoint API Manager desired-state config (Anypoint CLI v4)",
+  "description": "Editor aid only. The authoritative validator is Read-ApimConfig in src/ApimSync.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiInstance", "policies"],
+  "properties": {
+    "apiInstance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["assetId", "assetVersion", "instanceLabel"],
+      "properties": {
+        "assetId": { "type": "string", "minLength": 1 },
+        "groupId": { "type": ["string", "null"] },
+        "assetVersion": { "type": "string", "minLength": 1 },
+        "productVersion": { "type": ["string", "null"] },
+        "instanceLabel": { "type": "string", "minLength": 1 },
+        "deploymentType": { "type": "string", "enum": ["cloudhub", "cloudhub2", "hybrid", "rtf"] },
+        "endpoint": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "implementationUri": { "type": ["string", "null"] },
+            "consumerUri": { "type": ["string", "null"] },
+            "type": { "type": ["string", "null"], "enum": ["http", "raml", "wsdl", "mcp", "a2a", "llm", "grpc", null] },
+            "scheme": { "type": ["string", "null"], "enum": ["http", "https", null] },
+            "port": { "type": ["integer", "string", "null"] },
+            "path": { "type": ["string", "null"] },
+            "withProxy": { "type": ["boolean", "null"] },
+            "responseTimeout": { "type": ["integer", "null"] },
+            "muleVersion4OrAbove": { "type": ["boolean", "null"] }
+          }
+        }
+      }
+    },
+    "promotion": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "fromEnvironment": { "type": ["string", "null"] },
+        "sourceInstanceLabel": { "type": ["string", "null"] },
+        "copyPolicies": { "type": "boolean" },
+        "copyTiers": { "type": "boolean" },
+        "copyAlerts": { "type": "boolean" }
+      }
+    },
+    "prune": { "type": "boolean" },
+    "policies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["assetId", "version", "configurationData"],
+        "properties": {
+          "assetId": { "type": "string", "minLength": 1 },
+          "groupId": { "type": ["string", "null"] },
+          "version": { "type": "string", "minLength": 1 },
+          "order": { "type": ["integer", "null"], "minimum": 1 },
+          "disabled": { "type": "boolean" },
+          "pointcutData": { "type": ["array", "null"] },
+          "configurationData": { "type": "object" }
+        }
+      }
+    }
+  }
+}

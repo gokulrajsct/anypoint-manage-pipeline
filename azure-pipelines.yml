@@ -1,0 +1,161 @@
+# Anypoint API Manager - declarative instance + policy deployment.
+#
+# ONE pipeline, config-driven. There is no per-API code: every *.yaml under
+# config/<env>/ in the config repo is an API ("project") that gets reconciled.
+# Add a file -> it deploys on the next run. No pipeline edits to onboard an API.
+#
+# action = deploy  -> promote through the environment STAGES:
+#            Test -> UAT -> PreProd -> Prod
+#          PreProd and Prod are gated by approvals (configured on the ADO
+#          Environment objects, see below). `targetEnvironment` decides how far
+#          the run goes.
+# action = extract -> read live policies from the initial env and commit them
+#          back to the config repo (initial env only).
+#
+# Runtime Manager / Mule app deployment is out of scope.
+
+name: apim-$(Build.BuildId)
+
+trigger: none            # this pipeline's own repo does not trigger it
+pr: none
+
+parameters:
+  - name: action
+    displayName: Action
+    type: string
+    default: deploy
+    values: [deploy, extract]
+
+  - name: targetEnvironment
+    displayName: Deploy up to (deploy only)
+    type: string
+    default: test
+    values: [test, uat, preprod, prod]
+
+  - name: apiKey
+    displayName: API config stem, or "all"
+    type: string
+    default: all
+
+  - name: dryRun
+    displayName: Dry run (plan only, no changes)
+    type: boolean
+    default: true
+
+  - name: createMode
+    displayName: How to create a missing instance
+    type: string
+    default: auto
+    values: [auto, scratch, promote]
+
+  - name: prune
+    displayName: Prune override
+    type: string
+    default: fromconfig
+    values: [fromconfig, "true", "false"]
+
+resources:
+  repositories:
+    - repository: configRepo
+      type: git
+      name: MyProject/anypoint-policy-config     # <-- set to your config repo
+      ref: refs/heads/main
+      trigger:                                    # a merge to the config repo runs this pipeline
+        branches:
+          include: [main]
+
+variables:
+  - name: pipelineDir
+    value: "$(Build.SourcesDirectory)/pipeline"
+  - name: configRepoDir
+    value: "$(Build.SourcesDirectory)/config-repo"
+  - name: initialEnv
+    value: test                                   # first env in the promotion chain
+
+stages:
+  # ---- deploy: promote through environments --------------------------------
+  - stage: Test
+    displayName: Test
+    condition: eq('${{ parameters.action }}', 'deploy')
+    jobs:
+      - template: pipelines/templates/reconcile-job.yml
+        parameters:
+          environment: test
+          apiKey: ${{ parameters.apiKey }}
+          dryRun: ${{ parameters.dryRun }}
+          createMode: ${{ parameters.createMode }}
+          prune: ${{ parameters.prune }}
+          initialEnv: test
+          pipelineDir: $(pipelineDir)
+          configDir: "$(Build.SourcesDirectory)/config-repo/config/test"
+
+  - stage: UAT
+    displayName: UAT
+    dependsOn: Test
+    condition: >-
+      and(succeeded(), eq('${{ parameters.action }}', 'deploy'),
+          in('${{ parameters.targetEnvironment }}', 'uat', 'preprod', 'prod'))
+    jobs:
+      - template: pipelines/templates/reconcile-job.yml
+        parameters:
+          environment: uat
+          apiKey: ${{ parameters.apiKey }}
+          dryRun: ${{ parameters.dryRun }}
+          createMode: ${{ parameters.createMode }}
+          prune: ${{ parameters.prune }}
+          initialEnv: test
+          pipelineDir: $(pipelineDir)
+          configDir: "$(Build.SourcesDirectory)/config-repo/config/uat"
+
+  # PreProd + Prod: add an "Approvals" check on ADO Environments
+  #   anypoint-preprod and anypoint-prod (Pipelines > Environments > ... > Approvals
+  #   and checks). The deployment job below binds to those environments.
+  - stage: PreProd
+    displayName: Pre-Prod (approval)
+    dependsOn: UAT
+    condition: >-
+      and(succeeded(), eq('${{ parameters.action }}', 'deploy'),
+          in('${{ parameters.targetEnvironment }}', 'preprod', 'prod'))
+    jobs:
+      - template: pipelines/templates/reconcile-job.yml
+        parameters:
+          environment: preprod
+          apiKey: ${{ parameters.apiKey }}
+          dryRun: ${{ parameters.dryRun }}
+          createMode: ${{ parameters.createMode }}
+          prune: ${{ parameters.prune }}
+          initialEnv: test
+          pipelineDir: $(pipelineDir)
+          configDir: "$(Build.SourcesDirectory)/config-repo/config/preprod"
+
+  - stage: Prod
+    displayName: Prod (approval)
+    dependsOn: PreProd
+    condition: >-
+      and(succeeded(), eq('${{ parameters.action }}', 'deploy'),
+          eq('${{ parameters.targetEnvironment }}', 'prod'))
+    jobs:
+      - template: pipelines/templates/reconcile-job.yml
+        parameters:
+          environment: prod
+          apiKey: ${{ parameters.apiKey }}
+          dryRun: ${{ parameters.dryRun }}
+          createMode: ${{ parameters.createMode }}
+          prune: ${{ parameters.prune }}
+          initialEnv: test
+          pipelineDir: $(pipelineDir)
+          configDir: "$(Build.SourcesDirectory)/config-repo/config/prod"
+
+  # ---- extract: live policies -> config repo (initial env only) ------------
+  - stage: Extract
+    displayName: Extract initial-env policies -> config repo
+    condition: eq('${{ parameters.action }}', 'extract')
+    jobs:
+      - template: pipelines/templates/extract-job.yml
+        parameters:
+          apiKey: ${{ parameters.apiKey }}
+          dryRun: ${{ parameters.dryRun }}
+          initialEnv: test
+          pipelineDir: $(pipelineDir)
+          configRepoDir: $(configRepoDir)
+          configDir: "$(Build.SourcesDirectory)/config-repo/config/test"

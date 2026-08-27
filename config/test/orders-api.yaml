@@ -1,0 +1,47 @@
+# Desired state for the "orders-api" API Manager instance in TEST (the initial env).
+# The file name (stem) IS the project/api key. Add a file per API per env - no
+# pipeline change is needed to onboard a new API.
+apiInstance:
+  assetId: orders-api
+  groupId: null                 # null -> current org (ANYPOINT_ORG)
+  assetVersion: "1.0.3"
+  productVersion: v1
+  instanceLabel: orders-api-test
+  deploymentType: cloudhub2
+  endpoint:
+    implementationUri: https://orders-backend.test.svc.example.com:8443/
+    type: http
+    scheme: https
+    port: 8081
+    path: /
+    withProxy: true
+    muleVersion4OrAbove: true
+
+promotion:
+  fromEnvironment: null         # initial env: created from scratch, never promoted
+  copyPolicies: false
+  copyTiers: false
+  copyAlerts: false
+
+prune: true
+
+policies:
+  - assetId: rate-limiting-sla
+    groupId: 68ef9520-24e9-4cf2-b2f5-620025690913
+    version: "1.4.0"
+    order: 1
+    configurationData:
+      clusterizable: true
+      exposeHeaders: true
+      rateLimits:
+        - maximumRequests: 200
+          timePeriodInMilliseconds: 60000
+
+  - assetId: client-id-enforcement
+    groupId: 68ef9520-24e9-4cf2-b2f5-620025690913
+    version: "1.3.2"
+    order: 2
+    configurationData:
+      credentialsOrigin: customExpression
+      clientIdExpression: "#[attributes.headers['client_id']]"
+      clientSecretExpression: "#[attributes.headers['client_secret']]"

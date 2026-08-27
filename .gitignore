@@ -1,0 +1,4 @@
+local/.env
+plan.json
+testResults.xml
+*.tmp

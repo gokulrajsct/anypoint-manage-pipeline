@@ -1,0 +1,90 @@
+# Reusable job: reconcile ONE environment with the Anypoint CLI.
+#
+# Called once per stage (Test / UAT / PreProd / Prod). Secrets come from a
+# per-environment variable group named  anypoint-<env>  (ideally Key Vault backed):
+#   ANYPOINT_CLIENT_ID      (secret)  - connected app client id  (that env's business group)
+#   ANYPOINT_CLIENT_SECRET  (secret)  - connected app client secret
+#   ANYPOINT_ORG                       - business group / org name or id
+#   APIM_ENV_MAP                       - JSON logical->Anypoint env names, e.g.
+#                                        {"test":"Test","uat":"UAT","preprod":"Pre-Prod","prod":"Production"}
+#   ANYPOINT_HOST           (optional) - eu1.anypoint.mulesoft.com for EU
+#
+# The job's `environment: anypoint-<env>` binds to an ADO Environment - put the
+# approval checks on anypoint-preprod and anypoint-prod there.
+
+parameters:
+  - name: environment
+    type: string
+  - name: apiKey
+    type: string
+  - name: dryRun
+    type: boolean
+  - name: createMode
+    type: string
+  - name: prune
+    type: string
+  - name: initialEnv
+    type: string
+  - name: pipelineDir
+    type: string
+  - name: configDir
+    type: string
+
+jobs:
+  - deployment: reconcile_${{ parameters.environment }}
+    displayName: reconcile ${{ parameters.environment }}
+    pool:
+      vmImage: ubuntu-latest
+    environment: anypoint-${{ parameters.environment }}
+    variables:
+      - group: anypoint-${{ parameters.environment }}
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            # Azure DevOps clones both repos here - nothing clones in the scripts.
+            - checkout: self
+              path: s/pipeline
+            - checkout: configRepo
+              path: s/config-repo
+
+            - task: NodeTool@0
+              inputs:
+                versionSpec: '20.x'
+              displayName: Use Node 20
+
+            - bash: |
+                set -euo pipefail
+                npm install -g anypoint-cli-v4
+                anypoint-cli-v4 plugins:install anypoint-cli-api-mgr-plugin
+                pwsh -NoProfile -Command "Install-Module powershell-yaml -Scope CurrentUser -Force -AllowClobber"
+              displayName: Install Anypoint CLI + powershell-yaml
+
+            - pwsh: |
+                ./Invoke-ApimSync.ps1 -Action validate `
+                  -ConfigDir "${{ parameters.configDir }}" -Api "${{ parameters.apiKey }}"
+              displayName: Validate config
+              workingDirectory: ${{ parameters.pipelineDir }}
+
+            - pwsh: |
+                ./Invoke-ApimSync.ps1 -Action reconcile `
+                  -Environment "${{ parameters.environment }}" `
+                  -ConfigDir "${{ parameters.configDir }}" `
+                  -Api "${{ parameters.apiKey }}" `
+                  -CreateMode "${{ parameters.createMode }}" `
+                  -Prune "${{ parameters.prune }}" `
+                  -PlanOut "$(Build.ArtifactStagingDirectory)/plan-${{ parameters.environment }}.json" `
+                  -DryRun:$${{ parameters.dryRun }}
+              displayName: 'Reconcile ${{ parameters.environment }} (dryRun=${{ parameters.dryRun }})'
+              workingDirectory: ${{ parameters.pipelineDir }}
+              env:
+                ANYPOINT_CLIENT_ID: $(ANYPOINT_CLIENT_ID)
+                ANYPOINT_CLIENT_SECRET: $(ANYPOINT_CLIENT_SECRET)
+                ANYPOINT_ORG: $(ANYPOINT_ORG)
+                APIM_ENV_MAP: $(APIM_ENV_MAP)
+                APIM_INITIAL_ENV: ${{ parameters.initialEnv }}
+
+            - publish: $(Build.ArtifactStagingDirectory)/plan-${{ parameters.environment }}.json
+              artifact: reconcile-plan-${{ parameters.environment }}
+              displayName: Publish plan
+              condition: always()

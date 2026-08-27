@@ -1,0 +1,66 @@
+# Reusable job: extract the initial-env policies and commit them to the config repo.
+#
+# Uses the anypoint-<initialEnv> variable group (same secret names as reconcile-job.yml).
+# Azure DevOps clones the config repo (checkout below, persistCredentials so the job
+# can push). The build service identity needs "Contribute" on the config repo.
+
+parameters:
+  - name: apiKey
+    type: string
+  - name: dryRun
+    type: boolean
+  - name: initialEnv
+    type: string
+  - name: pipelineDir
+    type: string
+  - name: configRepoDir
+    type: string
+  - name: configDir
+    type: string
+
+jobs:
+  - job: extract_initial
+    displayName: extract ${{ parameters.initialEnv }}
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+      - group: anypoint-${{ parameters.initialEnv }}
+    steps:
+      - checkout: self
+        path: s/pipeline
+      - checkout: configRepo
+        path: s/config-repo
+        persistCredentials: true
+
+      - task: NodeTool@0
+        inputs:
+          versionSpec: '20.x'
+        displayName: Use Node 20
+
+      - bash: |
+          set -euo pipefail
+          npm install -g anypoint-cli-v4
+          anypoint-cli-v4 plugins:install anypoint-cli-api-mgr-plugin
+          pwsh -NoProfile -Command "Install-Module powershell-yaml -Scope CurrentUser -Force -AllowClobber"
+        displayName: Install Anypoint CLI + powershell-yaml
+
+      - pwsh: |
+          # dryRun=false -> also push the updated config to the config repo default branch
+          ./Invoke-ApimSync.ps1 -Action extract `
+            -Environment "${{ parameters.initialEnv }}" `
+            -ConfigDir "${{ parameters.configDir }}" `
+            -Api "${{ parameters.apiKey }}" `
+            -RepoDir "${{ parameters.configRepoDir }}" `
+            -Branch main `
+            -Commit `
+            -Push:$${{ eq(parameters.dryRun, false) }}
+        displayName: 'Extract ${{ parameters.initialEnv }} policies (push=${{ eq(parameters.dryRun, false) }})'
+        workingDirectory: ${{ parameters.pipelineDir }}
+        env:
+          ANYPOINT_CLIENT_ID: $(ANYPOINT_CLIENT_ID)
+          ANYPOINT_CLIENT_SECRET: $(ANYPOINT_CLIENT_SECRET)
+          ANYPOINT_ORG: $(ANYPOINT_ORG)
+          APIM_ENV_MAP: $(APIM_ENV_MAP)
+          APIM_INITIAL_ENV: ${{ parameters.initialEnv }}
+          GIT_COMMITTER_NAME: "Azure Pipelines"
+          GIT_COMMITTER_EMAIL: "build@noreply.local"
