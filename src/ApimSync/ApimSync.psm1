@@ -13,9 +13,12 @@ $script:DeploymentTypeMap = @{
     'cloudhub2' = 'cloudhub2'; 'cloudhub' = 'cloudhub'; 'hybrid' = 'hybrid'; 'rtf' = 'rtf'
 }
 
-# Config keys a policy requires on `policy apply` but never returns from `policy list`.
-# They are still sent on apply/edit; they are just excluded from the desired-vs-live
-# diff so reconcile can converge. Keyed by "<groupId>:<assetId>".
+# configurationData keys excluded from the desired-vs-live diff (top level only) so
+# reconcile can converge. Two reasons a key lands here:
+#   - required on `policy apply` but never echoed by `policy list` (e.g. jwt-validation textKey)
+#   - injected by `policy list` but not part of desired config (e.g. assetId/assetVersion)
+# Ignored for comparison only; the full configurationData is still sent on apply/edit.
+$script:PolicyConfigDiffIgnoreCommon = @('assetId', 'assetVersion', 'policyTemplateId')
 $script:PolicyConfigDiffIgnore = @{
     "$($script:MuleSoftGroupId):jwt-validation" = @('textKey')
 }
@@ -137,11 +140,85 @@ function Test-ApimConfigTreeEqual {
     }
     if (($null -ne $dArr) -or ($null -ne $lArr)) { return $false }
 
-    if (($Desired -is [bool]) -or ($Live -is [bool])) { return ([bool]$Desired) -eq ([bool]$Live) }
+    # bool on either side, or "true"/"false" text on both (policy list stringifies scalars)
+    $dBoolish = ($Desired -is [bool]) -or ("$Desired".Trim() -match '^(?i:true|false)$')
+    $lBoolish = ($Live -is [bool]) -or ("$Live".Trim() -match '^(?i:true|false)$')
+    if ((($Desired -is [bool]) -or ($Live -is [bool])) -or ($dBoolish -and $lBoolish)) {
+        return (ConvertTo-ApimBool $Desired) -eq (ConvertTo-ApimBool $Live)
+    }
     if (("$Desired" -match '^\s*-?\d+(\.\d+)?\s*$') -and ("$Live" -match '^\s*-?\d+(\.\d+)?\s*$')) {
         return ([double]$Desired) -eq ([double]$Live)
     }
     return "$Desired" -eq "$Live"
+}
+
+function ConvertTo-ApimBool {
+    <# PowerShell's [bool]"false" is $true; parse the text instead. #>
+    param($Value)
+    if ($Value -is [bool]) { return $Value }
+    return ("$Value".Trim().ToLower() -eq 'true')
+}
+
+function Format-ApimDiffValue {
+    param($Value)
+    if ($null -eq $Value) { return '<null>' }
+    if ($null -ne (ConvertTo-Dict $Value)) { return '<object>' }
+    if ($null -ne (ConvertTo-Arr $Value)) { return '<array>' }
+    $s = "$Value"
+    if ($s.Length -gt 80) { $s = $s.Substring(0, 77) + '...' }
+    return "'$s' [$($Value.GetType().Name)]"
+}
+
+function Get-ApimConfigTreeDiff {
+    <# Paths where Desired would change Live. Same equality rules as Test-ApimConfigTreeEqual. #>
+    param($Desired, $Live, [string]$Path = '')
+
+    if (Test-ApimMaskedValue $Live) { return @() }
+
+    $dNull = ($null -eq $Desired); $lNull = ($null -eq $Live)
+    if ($dNull -and $lNull) { return @() }
+    if ($dNull -or $lNull) {
+        return @("$Path : desired=$(Format-ApimDiffValue $Desired) live=$(Format-ApimDiffValue $Live)")
+    }
+
+    $dDict = ConvertTo-Dict $Desired; $lDict = ConvertTo-Dict $Live
+    if (($null -ne $dDict) -and ($null -ne $lDict)) {
+        $diffs = @()
+        $dKeys = @($dDict.Keys | ForEach-Object { "$_" })
+        $lKeys = @($lDict.Keys | ForEach-Object { "$_" })
+        foreach ($k in ($dKeys | Where-Object { $lKeys -notcontains $_ })) {
+            $diffs += "$Path/$k : only in config (=$(Format-ApimDiffValue $dDict[$k]))"
+        }
+        foreach ($k in ($lKeys | Where-Object { $dKeys -notcontains $_ })) {
+            $diffs += "$Path/$k : only on live policy (=$(Format-ApimDiffValue $lDict[$k]))"
+        }
+        foreach ($k in ($dKeys | Where-Object { $lKeys -contains $_ })) {
+            $diffs += Get-ApimConfigTreeDiff $dDict[$k] $lDict[$k] "$Path/$k"
+        }
+        return $diffs
+    }
+    if (($null -ne $dDict) -or ($null -ne $lDict)) {
+        return @("$Path : one side is an object, the other is not")
+    }
+
+    $dArr = ConvertTo-Arr $Desired; $lArr = ConvertTo-Arr $Live
+    if (($null -ne $dArr) -and ($null -ne $lArr)) {
+        $dArr = [object[]]@($dArr); $lArr = [object[]]@($lArr)
+        if ($dArr.Count -ne $lArr.Count) {
+            return @("$Path : array length config=$($dArr.Count) live=$($lArr.Count)")
+        }
+        $diffs = @()
+        for ($i = 0; $i -lt $dArr.Count; $i++) {
+            $diffs += Get-ApimConfigTreeDiff $dArr[$i] $lArr[$i] "$Path[$i]"
+        }
+        return $diffs
+    }
+    if (($null -ne $dArr) -or ($null -ne $lArr)) {
+        return @("$Path : one side is an array, the other is not")
+    }
+
+    if (Test-ApimConfigTreeEqual $Desired $Live) { return @() }
+    return @("$Path : config=$(Format-ApimDiffValue $Desired) live=$(Format-ApimDiffValue $Live)")
 }
 
 function Restore-ApimMaskedValue {
@@ -510,10 +587,9 @@ function ConvertTo-ApimNormalizedPolicy {
 }
 
 function Remove-ApimIgnoredConfigKey {
-    <# Drop keys listed in $script:PolicyConfigDiffIgnore for this policy, for diffing only. #>
+    <# Drop ignored top-level keys (common + per-policy) for this policy, for diffing only. #>
     param($Config, [string]$PolicyKey)
-    $ignore = $script:PolicyConfigDiffIgnore[$PolicyKey]
-    if (-not $ignore) { return $Config }
+    $ignore = @($script:PolicyConfigDiffIgnoreCommon) + @($script:PolicyConfigDiffIgnore[$PolicyKey])
     $d = ConvertTo-Dict $Config
     if ($null -eq $d) { return $Config }
     $out = [ordered]@{}
@@ -540,14 +616,22 @@ function Get-ApimPolicyPlan {
             $add += $dp
             continue
         }
-        $cfgEqual = Test-ApimConfigTreeEqual `
-            (Remove-ApimIgnoredConfigKey $dp.Config $dp.Key) `
-            (Remove-ApimIgnoredConfigKey $lp.Config $lp.Key)
+        $dCfg = Remove-ApimIgnoredConfigKey $dp.Config $dp.Key
+        $lCfg = Remove-ApimIgnoredConfigKey $lp.Config $lp.Key
+        $cfgEqual = Test-ApimConfigTreeEqual $dCfg $lCfg
         $pcEqual = ($dp.PointcutJson -eq $lp.PointcutJson)
         if (-not ($cfgEqual -and $pcEqual)) {
             $changes = @()
-            if (-not $cfgEqual) { $changes += 'config' }
-            if (-not $pcEqual) { $changes += 'pointcut' }
+            if (-not $cfgEqual) {
+                $changes += 'config'
+                foreach ($d in (Get-ApimConfigTreeDiff $dCfg $lCfg 'configurationData')) {
+                    Write-Host "  [diff] $($dp.AssetId) $d"
+                }
+            }
+            if (-not $pcEqual) {
+                $changes += 'pointcut'
+                Write-Host "  [diff] $($dp.AssetId) pointcutData : config=$($dp.PointcutJson) live=$($lp.PointcutJson)"
+            }
             $edit += [pscustomobject]@{ Desired = $dp; InstanceId = $lp.InstanceId; Changes = $changes }
         }
         if ($dp.Disabled -ne $lp.Disabled) {
@@ -809,6 +893,7 @@ Export-ModuleMember -Function @(
     'Read-ApimConfig', 'Get-ApimConfigList',
     'Invoke-ApimReconcile', 'Export-ApimConfig', 'Invoke-ApimConfigCommit',
     'Get-ApimPolicyPlan', 'ConvertTo-ApimNormalizedPolicy', 'Test-ApimConfigTreeEqual',
+    'Get-ApimConfigTreeDiff',
     'Write-ApimPlan', 'Invoke-AnypointCli', 'Resolve-ApimEnvironmentName',
     'Get-ApimEnvironmentId', 'Get-ApimInstanceId', 'Get-ApimAppliedPolicy',
     'New-ApimInstance', 'Invoke-ApimPromotion', 'Get-ApimInitialEnv'
