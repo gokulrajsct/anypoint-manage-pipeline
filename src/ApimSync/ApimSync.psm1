@@ -567,7 +567,7 @@ function ConvertTo-ApimNormalizedPolicy {
         $order = Get-DictValue $d 'order'
         $disVal = Get-DictValue $d 'disabled'
         $disabled = if ($null -eq $disVal) { $false } else { [bool]$disVal }
-        $config = Get-FirstValue $d @('configurationData', 'configuration')
+        $config = ConvertFrom-ApimConfigBlob (Get-FirstValue $d @('configurationData', 'configuration'))
         $pointcut = Get-FirstValue $d @('pointcutData', 'pointcut')
         $instanceId = Get-FirstValue $d @('policyId', 'id')
     }
@@ -584,6 +584,28 @@ function ConvertTo-ApimNormalizedPolicy {
         PointcutJson = (ConvertTo-CanonicalJson $pointcut)
         InstanceId   = if ($null -ne $instanceId) { "$instanceId" } else { $null }
     }
+}
+
+function ConvertFrom-ApimConfigBlob {
+    <# `policy list` returns some policy configs as a newline-delimited "key: value"
+       string instead of an object. Parse that into a dict so it can be compared.
+       Non-strings and already-structured values pass through unchanged. #>
+    param($Config)
+    if ($Config -isnot [string]) { return $Config }
+    $t = $Config.Trim()
+    if ($t -eq '') { return $Config }
+    if ($t.StartsWith('{') -or $t.StartsWith('[')) {
+        try { return ($t | ConvertFrom-Json) } catch { return $Config }
+    }
+    $h = [ordered]@{}
+    foreach ($line in ($t -split "`r?`n")) {
+        $i = $line.IndexOf(':')
+        if ($i -lt 1) { continue }
+        $key = $line.Substring(0, $i).Trim()
+        if ($key) { $h[$key] = $line.Substring($i + 1).Trim() }
+    }
+    if ($h.Count -eq 0) { return $Config }
+    return $h
 }
 
 function Remove-ApimIgnoredConfigKey {
@@ -893,7 +915,7 @@ Export-ModuleMember -Function @(
     'Read-ApimConfig', 'Get-ApimConfigList',
     'Invoke-ApimReconcile', 'Export-ApimConfig', 'Invoke-ApimConfigCommit',
     'Get-ApimPolicyPlan', 'ConvertTo-ApimNormalizedPolicy', 'Test-ApimConfigTreeEqual',
-    'Get-ApimConfigTreeDiff',
+    'Get-ApimConfigTreeDiff', 'ConvertFrom-ApimConfigBlob',
     'Write-ApimPlan', 'Invoke-AnypointCli', 'Resolve-ApimEnvironmentName',
     'Get-ApimEnvironmentId', 'Get-ApimInstanceId', 'Get-ApimAppliedPolicy',
     'New-ApimInstance', 'Invoke-ApimPromotion', 'Get-ApimInitialEnv'

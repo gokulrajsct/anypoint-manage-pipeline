@@ -9,6 +9,7 @@
         'Read-ApimConfig', 'Get-ApimConfigList',
         'Invoke-ApimReconcile', 'Export-ApimConfig', 'Invoke-ApimConfigCommit',
         'Get-ApimPolicyPlan', 'ConvertTo-ApimNormalizedPolicy', 'Test-ApimConfigTreeEqual',
+        'Get-ApimConfigTreeDiff', 'ConvertFrom-ApimConfigBlob',
         'Write-ApimPlan', 'Invoke-AnypointCli', 'Resolve-ApimEnvironmentName',
         'Get-ApimEnvironmentId', 'Get-ApimInstanceId', 'Get-ApimAppliedPolicy',
         'New-ApimInstance', 'Invoke-ApimPromotion', 'Get-ApimInitialEnv'

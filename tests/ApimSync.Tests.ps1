@@ -96,6 +96,43 @@ Describe 'Test-ApimConfigTreeEqual' {
     It 'compares numbers by value across string/number types' {
         Test-ApimConfigTreeEqual @{ n = 200 } @{ n = '200' } | Should -BeTrue
     }
+
+    It 'compares booleans across bool/string types' {
+        Test-ApimConfigTreeEqual @{ b = $false } @{ b = 'false' } | Should -BeTrue
+        Test-ApimConfigTreeEqual @{ b = $false } @{ b = 'true' } | Should -BeFalse
+    }
+}
+
+Describe 'ConvertFrom-ApimConfigBlob' {
+
+    It 'parses a newline "key: value" blob into a dict' {
+        $r = ConvertFrom-ApimConfigBlob "credentialsOrigin:customExpression`nclientIdExpression:#[attributes.headers['client_id']]"
+        $r['credentialsOrigin'] | Should -Be 'customExpression'
+        $r['clientIdExpression'] | Should -Be "#[attributes.headers['client_id']]"
+    }
+
+    It 'splits only on the first colon so expression values survive' {
+        $r = ConvertFrom-ApimConfigBlob 'x:#[now() as String {format: "yyyy"}]'
+        $r['x'] | Should -Be '#[now() as String {format: "yyyy"}]'
+    }
+
+    It 'passes structured input through unchanged' {
+        $in = @{ a = 1 }
+        ConvertFrom-ApimConfigBlob $in | Should -Be $in
+    }
+
+    It 'lets a blob-config live policy match a structured desired policy' {
+        $g = '68ef9520-24e9-4cf2-b2f5-620025690913'
+        $desired = ConvertTo-ApimNormalizedPolicy -Kind Desired -Raw @{
+            assetId = 'client-id-enforcement'; groupId = $g; version = '1.3.2'
+            configurationData = @{ credentialsOrigin = 'customExpression'; clientIdExpression = "#[a]" }
+        }
+        $live = ConvertTo-ApimNormalizedPolicy -Kind Live -Raw @{
+            policyId = '5'; template = @{ assetId = 'client-id-enforcement'; groupId = $g; version = '1.3.2' }
+            configuration = "credentialsOrigin:customExpression`nclientIdExpression:#[a]"
+        }
+        (Get-ApimPolicyPlan -Desired @($desired) -Live @($live) -Prune $true).IsEmpty | Should -BeTrue
+    }
 }
 
 Describe 'Get-ApimPolicyPlan' {
