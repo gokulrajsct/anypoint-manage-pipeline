@@ -13,6 +13,13 @@ $script:DeploymentTypeMap = @{
     'cloudhub2' = 'cloudhub2'; 'cloudhub' = 'cloudhub'; 'hybrid' = 'hybrid'; 'rtf' = 'rtf'
 }
 
+# Config keys a policy requires on `policy apply` but never returns from `policy list`.
+# They are still sent on apply/edit; they are just excluded from the desired-vs-live
+# diff so reconcile can converge. Keyed by "<groupId>:<assetId>".
+$script:PolicyConfigDiffIgnore = @{
+    "$($script:MuleSoftGroupId):jwt-validation" = @('textKey')
+}
+
 function Get-ApimInitialEnv {
     if ($env:APIM_INITIAL_ENV) { return $env:APIM_INITIAL_ENV }
     return 'dev'
@@ -245,6 +252,7 @@ function Invoke-AnypointCli {
         [switch]$AllowFail
     )
     $exe = if ($env:ANYPOINT_CLI) { $env:ANYPOINT_CLI } else { 'anypoint-cli-v4' }
+    Write-Host "[anypoint-cli] $exe $($ArgumentList -join ' ')"
     $errFile = [System.IO.Path]::GetTempFileName()
     try {
         $stdout = (& $exe @ArgumentList 2> $errFile | Out-String)
@@ -254,6 +262,9 @@ function Invoke-AnypointCli {
     finally {
         Remove-Item -LiteralPath $errFile -ErrorAction SilentlyContinue
     }
+    Write-Host "[anypoint-cli] exit $code"
+    if ($stdout -and $stdout.Trim()) { Write-Host "[anypoint-cli] response:`n$($stdout.Trim())" }
+    if ($stderr -and $stderr.Trim()) { Write-Host "[anypoint-cli] stderr:`n$($stderr.Trim())" }
     if (($code -ne 0) -and -not $AllowFail) {
         throw "anypoint-cli-v4 $($ArgumentList -join ' ') failed (exit $code):`n$stderr`n$stdout"
     }
@@ -498,6 +509,18 @@ function ConvertTo-ApimNormalizedPolicy {
     }
 }
 
+function Remove-ApimIgnoredConfigKey {
+    <# Drop keys listed in $script:PolicyConfigDiffIgnore for this policy, for diffing only. #>
+    param($Config, [string]$PolicyKey)
+    $ignore = $script:PolicyConfigDiffIgnore[$PolicyKey]
+    if (-not $ignore) { return $Config }
+    $d = ConvertTo-Dict $Config
+    if ($null -eq $d) { return $Config }
+    $out = [ordered]@{}
+    foreach ($k in $d.Keys) { if ($ignore -notcontains "$k") { $out["$k"] = $d["$k"] } }
+    return $out
+}
+
 function Get-ApimPolicyPlan {
     [CmdletBinding()]
     param([object[]]$Desired = @(), [object[]]$Live = @(), [bool]$Prune = $true)
@@ -517,7 +540,9 @@ function Get-ApimPolicyPlan {
             $add += $dp
             continue
         }
-        $cfgEqual = Test-ApimConfigTreeEqual $dp.Config $lp.Config
+        $cfgEqual = Test-ApimConfigTreeEqual `
+            (Remove-ApimIgnoredConfigKey $dp.Config $dp.Key) `
+            (Remove-ApimIgnoredConfigKey $lp.Config $lp.Key)
         $pcEqual = ($dp.PointcutJson -eq $lp.PointcutJson)
         if (-not ($cfgEqual -and $pcEqual)) {
             $changes = @()
@@ -704,6 +729,17 @@ function Export-ApimConfig {
         $prior = if ($existingByKey.ContainsKey($n.Key)) { $existingByKey[$n.Key] } else { $null }
         $priorCfg = if ($prior) { Get-DictValue $prior 'configurationData' } else { $null }
         $restored = Restore-ApimMaskedValue (ConvertTo-CanonicalObject $n.Config) $priorCfg
+        # carry over apply-only keys (e.g. jwt-validation textKey) that `policy list` never returns
+        $ignore = $script:PolicyConfigDiffIgnore[$n.Key]
+        if ($ignore -and $priorCfg) {
+            $rd = ConvertTo-Dict $restored; $pd = ConvertTo-Dict $priorCfg
+            if (($null -ne $rd) -and ($null -ne $pd)) {
+                foreach ($ik in $ignore) {
+                    if (-not $rd.Contains($ik) -and $pd.Contains($ik)) { $rd["$ik"] = $pd["$ik"] }
+                }
+                $restored = ConvertTo-CanonicalObject $rd
+            }
+        }
         if ((ConvertTo-CanonicalJson $restored) -match '\*{3,}') {
             $warnings += "$($n.AssetId): a masked value has no prior in the config file - left as placeholder, edit before committing."
         }
