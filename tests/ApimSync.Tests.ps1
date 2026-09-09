@@ -129,6 +129,18 @@ Describe 'Test-ApimConfigTreeEqual' {
         Test-ApimConfigTreeEqual @{ b = $false } @{ b = 'false' } | Should -BeTrue
         Test-ApimConfigTreeEqual @{ b = $false } @{ b = 'true' } | Should -BeFalse
     }
+
+    It 'ignores keys present only on the live side (subset match)' {
+        Test-ApimConfigTreeEqual @{ a = 1 } @{ a = 1; b = 2; c = @{ d = 3 } } | Should -BeTrue
+    }
+
+    It 'a key in config but absent from live is still a difference' {
+        Test-ApimConfigTreeEqual @{ a = 1; b = 2 } @{ a = 1 } | Should -BeFalse
+    }
+
+    It 'a null config value against a live-absent key is a no-op' {
+        Test-ApimConfigTreeEqual @{ a = 1; b = $null } @{ a = 1 } | Should -BeTrue
+    }
 }
 
 Describe 'ConvertFrom-ApimConfigBlob' {
@@ -319,6 +331,56 @@ Describe 'ConvertTo-ApimNormalizedPolicy - table-shaped live (policy list / desc
         $plan = Get-ApimPolicyPlan -Desired @($desired) -Live @($live) -Prune $true
         $plan.Edit.Count | Should -Be 1
         $plan.Edit[0].Changes | Should -Contain 'pointcut'
+    }
+}
+
+Describe 'ConvertTo-ApimNormalizedPolicy - REST policy shape' {
+
+    # A policy object exactly as the Anypoint REST policies endpoint returns it.
+    It 'takes identity from template, not policyTemplateId / revision version' {
+        $g = '68ef9520-24e9-4cf2-b2f5-620025690913'
+        $rest = [pscustomobject]@{
+            policyTemplateId = '433839'; order = 1; pointcutData = $null; type = 'system'
+            policyId = 9181953; version = 1788921148318
+            configuration = [pscustomobject]@{ clusterizable = $true; rateLimits = @([pscustomobject]@{ maximumRequests = 100 }) }
+            template = [pscustomobject]@{ groupId = $g; assetId = 'rate-limiting'; assetVersion = '1.4.1' }
+        }
+        $n = ConvertTo-ApimNormalizedPolicy -Raw $rest -Kind Live
+        $n.AssetId    | Should -Be 'rate-limiting'      # not '433839'
+        $n.Version    | Should -Be '1.4.1'              # not '1788921148318'
+        $n.Key        | Should -Be "${g}:rate-limiting"
+        $n.InstanceId | Should -Be '9181953'
+        $n.Config.rateLimits[0].maximumRequests | Should -Be 100
+    }
+
+    It 'converges a minimal desired config against the full live REST config (subset)' {
+        $g = '68ef9520-24e9-4cf2-b2f5-620025690913'
+        $desired = ConvertTo-ApimNormalizedPolicy -Kind Desired -Raw @{
+            assetId = 'jwt-validation'; groupId = $g; version = '1.4.0'
+            configurationData = @{ jwksUrl = 'https://idp/keys'; skipClientIdValidation = $true; textKey = 'unused' }
+        }
+        $live = ConvertTo-ApimNormalizedPolicy -Kind Live -Raw ([pscustomobject]@{
+            policyId = 5; pointcutData = $null
+            template = [pscustomobject]@{ groupId = $g; assetId = 'jwt-validation'; assetVersion = '1.4.0' }
+            configuration = [pscustomobject]@{
+                jwksUrl = 'https://idp/keys'; skipClientIdValidation = $true
+                signingMethod = 'rsa'; signingKeyLength = '256'; jwksServiceTimeToLive = 60   # extra live-only keys
+            }
+        })
+        (Get-ApimPolicyPlan -Desired @($desired) -Live @($live) -Prune $true).IsEmpty | Should -BeTrue
+    }
+}
+
+Describe 'New-ApimPolicyConfigFile' {
+    It 'writes a .json file the CLI will accept' {
+        InModuleScope ApimSync {
+            $f = New-ApimPolicyConfigFile @{ a = 1 }
+            try {
+                [System.IO.Path]::GetExtension($f) | Should -Be '.json'
+                (Get-Content -Raw $f | ConvertFrom-Json).a | Should -Be 1
+            }
+            finally { Remove-Item -LiteralPath $f -ErrorAction SilentlyContinue }
+        }
     }
 }
 

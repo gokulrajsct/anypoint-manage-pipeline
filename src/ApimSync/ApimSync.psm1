@@ -115,7 +115,9 @@ function ConvertTo-CanonicalJson {
 }
 
 function Test-ApimConfigTreeEqual {
-    <# True when Desired would be a no-op against Live. Masked Live leaves are ignored. #>
+    <# True when Desired would be a no-op against Live: every key/value in Desired must
+       match Live. Keys present only on Live are ignored (the live policy carries defaults
+       and metadata the config never sets). Masked Live leaves are ignored. #>
     param($Desired, $Live)
 
     if (Test-ApimMaskedValue $Live) { return $true }
@@ -126,11 +128,13 @@ function Test-ApimConfigTreeEqual {
 
     $dDict = ConvertTo-Dict $Desired; $lDict = ConvertTo-Dict $Live
     if (($null -ne $dDict) -and ($null -ne $lDict)) {
-        $dKeys = @($dDict.Keys | ForEach-Object { "$_" } | Sort-Object)
-        $lKeys = @($lDict.Keys | ForEach-Object { "$_" } | Sort-Object)
-        if (($dKeys -join '|') -ne ($lKeys -join '|')) { return $false }
-        foreach ($k in $dKeys) {
-            if (-not (Test-ApimConfigTreeEqual $dDict[$k] $lDict[$k])) { return $false }
+        foreach ($k in $dDict.Keys) {
+            $ks = "$k"
+            if (-not $lDict.Contains($ks)) {
+                if (-not (Test-ApimConfigTreeEqual $dDict[$k] $null)) { return $false }
+                continue
+            }
+            if (-not (Test-ApimConfigTreeEqual $dDict[$k] $lDict[$ks])) { return $false }
         }
         return $true
     }
@@ -191,18 +195,15 @@ function Get-ApimConfigTreeDiff {
     $dDict = ConvertTo-Dict $Desired; $lDict = ConvertTo-Dict $Live
     if (($null -ne $dDict) -and ($null -ne $lDict)) {
         $diffs = @()
-        $dKeys = @($dDict.Keys | ForEach-Object { "$_" })
-        $lKeys = @($lDict.Keys | ForEach-Object { "$_" })
-        foreach ($k in ($dKeys | Where-Object { $lKeys -notcontains $_ })) {
-            $diffs += "$Path/$k : only in config (=$(Format-ApimDiffValue $dDict[$k]))"
+        foreach ($k in ($dDict.Keys | ForEach-Object { "$_" })) {
+            if (-not $lDict.Contains($k)) {
+                $diffs += "$Path/$k : in config but not on the live policy (=$(Format-ApimDiffValue $dDict[$k]))"
+            }
+            else {
+                $diffs += Get-ApimConfigTreeDiff $dDict[$k] $lDict[$k] "$Path/$k"
+            }
         }
-        foreach ($k in ($lKeys | Where-Object { $dKeys -notcontains $_ })) {
-            $diffs += "$Path/$k : only on live policy (=$(Format-ApimDiffValue $lDict[$k]))"
-        }
-        foreach ($k in ($dKeys | Where-Object { $lKeys -contains $_ })) {
-            $diffs += Get-ApimConfigTreeDiff $dDict[$k] $lDict[$k] "$Path/$k"
-        }
-        return $diffs
+        return $diffs   # keys only on the live policy are not drift - not reported
     }
     if (($null -ne $dDict) -or ($null -ne $lDict)) {
         return @("$Path : one side is an object, the other is not")
@@ -567,7 +568,8 @@ function Get-ApimAppliedPolicy {
 
 function New-ApimPolicyConfigFile {
     param($ConfigObject)
-    $file = [System.IO.Path]::GetTempFileName()
+    # anypoint-cli requires the --configFile to have a .json extension.
+    $file = Join-Path ([System.IO.Path]::GetTempPath()) ("apim-policy-{0}.json" -f [guid]::NewGuid().ToString('N'))
     $json = (ConvertTo-CanonicalObject $ConfigObject | ConvertTo-Json -Depth 40)
     if (-not $json) { $json = '{}' }
     Set-Content -LiteralPath $file -Value $json -Encoding utf8
@@ -663,14 +665,17 @@ function ConvertTo-ApimNormalizedPolicy {
         #   "ID", "Template ID", "Asset ID", "Asset Version", "Status", "Configuration".
         # There is no groupId in that shape, so fall back to the MuleSoft standard-policy
         # groupId (same default the Desired side uses) to keep the match key stable.
+        # REST puts identity under `template` (assetId / assetVersion). The CLI table shape
+        # uses `Asset ID` / `Asset Version` at top level. Never treat `policyTemplateId` or
+        # the top-level `version` (a revision number in the REST payload) as identity.
         $tmpl = ConvertTo-Dict (Get-DictValue $d 'template')
-        $groupId = Get-FirstValue $d @('groupId')
-        if (-not $groupId) { $groupId = Get-FirstValue $tmpl @('groupId') }
+        $groupId = Get-FirstValue $tmpl @('groupId')
+        if (-not $groupId) { $groupId = Get-FirstValue $d @('groupId') }
         if (-not $groupId) { $groupId = $script:MuleSoftGroupId }
-        $assetId = Get-FirstValue $d @('assetId', 'policyTemplateId', 'Asset ID')
-        if (-not $assetId) { $assetId = Get-FirstValue $tmpl @('assetId') }
-        $version = Get-FirstValue $d @('assetVersion', 'version', 'Asset Version')
-        if (-not $version) { $version = Get-FirstValue $tmpl @('version') }
+        $assetId = Get-FirstValue $tmpl @('assetId')
+        if (-not $assetId) { $assetId = Get-FirstValue $d @('assetId', 'Asset ID') }
+        $version = Get-FirstValue $tmpl @('assetVersion', 'version')
+        if (-not $version) { $version = Get-FirstValue $d @('assetVersion', 'Asset Version') }
         $version = "$version"
         $order = Get-DictValue $d 'order'
         $disVal = Get-DictValue $d 'disabled'
