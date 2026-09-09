@@ -28,6 +28,34 @@ Describe 'Read-ApimConfig' {
             Should -Throw -ExpectedMessage '*No config file for api*'
     }
 
+    It 'loads a JSON config file' {
+        $p = Join-Path $TestDrive 'orders-api.json'
+        @'
+{
+  "apiInstance": { "assetId": "orders-api", "assetVersion": "1.0.3", "instanceLabel": "orders-api-test", "deploymentType": "cloudhub2" },
+  "prune": false,
+  "policies": [
+    { "assetId": "rate-limiting-sla", "version": "1.4.0", "configurationData": { "rateLimits": [ { "maximumRequests": 200 } ] } }
+  ]
+}
+'@ | Set-Content -LiteralPath $p
+        $c = Read-ApimConfig -Path $p
+        $c.Key                       | Should -Be 'orders-api'
+        $c.ApiInstance.instanceLabel | Should -Be 'orders-api-test'
+        $c.Prune                     | Should -BeFalse
+        $c.Policies.Count            | Should -Be 1
+        $c.Policies[0].order         | Should -Be 1
+    }
+
+    It 'refuses when the same api is defined in two files' {
+        $d = Join-Path $TestDrive 'dupes'
+        New-Item -ItemType Directory -Path $d | Out-Null
+        '{}' | Set-Content -LiteralPath (Join-Path $d 'orders-api.yaml')
+        '{}' | Set-Content -LiteralPath (Join-Path $d 'orders-api.json')
+        { Get-ApimConfigList -ConfigDir $d -Api all }        | Should -Throw -ExpectedMessage '*Ambiguous config*'
+        { Get-ApimConfigList -ConfigDir $d -Api 'orders-api' } | Should -Throw -ExpectedMessage '*Multiple config files*'
+    }
+
     It 'rejects an invalid deploymentType' {
         $p = Join-Path $TestDrive 'bad.yaml'
         @'
@@ -112,8 +140,26 @@ Describe 'ConvertFrom-ApimConfigBlob' {
     }
 
     It 'splits only on the first colon so expression values survive' {
-        $r = ConvertFrom-ApimConfigBlob 'x:#[now() as String {format: "yyyy"}]'
+        $r = ConvertFrom-ApimConfigBlob 'x: #[now() as String {format: "yyyy"}]'
         $r['x'] | Should -Be '#[now() as String {format: "yyyy"}]'
+    }
+
+    It 'keeps DataWeave "#[...]" values literal (not a YAML comment)' {
+        $blob = "clientIdExpression: #[attributes.headers['client_id']]`n" +
+                "clientSecretExpression: #[attributes.headers['client_secret']]`n" +
+                "credentialsOriginHasHttpBasicAuthenticationHeader: customExpression"
+        $r = ConvertFrom-ApimConfigBlob $blob
+        $r['clientIdExpression'] | Should -Be "#[attributes.headers['client_id']]"
+        $r['clientSecretExpression'] | Should -Be "#[attributes.headers['client_secret']]"
+        $r['credentialsOriginHasHttpBasicAuthenticationHeader'] | Should -Be 'customExpression'
+    }
+
+    It 'reassembles a multi-line JSON value' {
+        $blob = "clusterizable: true`nexposeHeaders: false`nrateLimits: [`n  {`n    ""maximumRequests"": 100,`n    ""timePeriodInMilliseconds"": 60000`n  }`n]"
+        $r = ConvertFrom-ApimConfigBlob $blob
+        $r['clusterizable'] | Should -Be 'true'
+        @($r['rateLimits']).Count | Should -Be 1
+        $r['rateLimits'][0].maximumRequests | Should -Be 100
     }
 
     It 'passes structured input through unchanged' {
@@ -132,6 +178,131 @@ Describe 'ConvertFrom-ApimConfigBlob' {
             configuration = "credentialsOrigin:customExpression`nclientIdExpression:#[a]"
         }
         (Get-ApimPolicyPlan -Desired @($desired) -Live @($live) -Prune $true).IsEmpty | Should -BeTrue
+    }
+}
+
+Describe 'ConvertTo-ApimNormalizedPolicy - table-shaped live (policy list / describe)' {
+
+    # Fields/values as returned by `anypoint-cli-v4 api-mgr policy list --output json`.
+    BeforeAll {
+        $script:LiveRl = [ordered]@{
+            'ID' = 9181953; 'Template ID' = '433839'; 'Asset ID' = 'rate-limiting'
+            'Asset Version' = '1.4.1'; 'Label' = $null; 'Status' = 'Enabled'
+            'Configuration' = "clusterizable: true`nexposeHeaders: false`nrateLimits: [`n  {`n    `"maximumRequests`": 100,`n    `"timePeriodInMilliseconds`": 60000`n  }`n]"
+            'Updated' = '16 minutes ago'
+        }
+        $script:LiveCie = [ordered]@{
+            'ID' = 9181954; 'Template ID' = '433807'; 'Asset ID' = 'client-id-enforcement'
+            'Asset Version' = '1.3.3'; 'Label' = $null; 'Status' = 'Enabled'
+            'Configuration' = "clientIdExpression: #[attributes.headers['client_id']]`nclientSecretExpression: #[attributes.headers['client_secret']]`ncredentialsOriginHasHttpBasicAuthenticationHeader: customExpression"
+            'Updated' = '16 minutes ago'
+        }
+    }
+
+    It 'maps ID / Asset ID / Asset Version / Status and defaults the groupId' {
+        $g = '68ef9520-24e9-4cf2-b2f5-620025690913'
+        $cie = ConvertTo-ApimNormalizedPolicy -Raw $script:LiveCie -Kind Live
+        $cie.InstanceId | Should -Be '9181954'
+        $cie.Version    | Should -Be '1.3.3'
+        $cie.Disabled   | Should -BeFalse
+        $cie.Key        | Should -Be "${g}:client-id-enforcement"
+    }
+
+    It 'converges against matching desired config (no residual EDIT)' {
+        $g = '68ef9520-24e9-4cf2-b2f5-620025690913'
+        $desired = @(
+            (ConvertTo-ApimNormalizedPolicy -Kind Desired -Raw @{
+                assetId = 'rate-limiting'; groupId = $g; version = '1.4.1'
+                configurationData = @{ clusterizable = $true; exposeHeaders = $false
+                    rateLimits = @(@{ maximumRequests = 100; timePeriodInMilliseconds = 60000 }) }
+            }),
+            (ConvertTo-ApimNormalizedPolicy -Kind Desired -Raw @{
+                assetId = 'client-id-enforcement'; groupId = $g; version = '1.3.3'
+                configurationData = @{
+                    clientIdExpression = "#[attributes.headers['client_id']]"
+                    clientSecretExpression = "#[attributes.headers['client_secret']]"
+                    credentialsOriginHasHttpBasicAuthenticationHeader = 'customExpression' }
+            })
+        )
+        $live = @($script:LiveRl, $script:LiveCie | ForEach-Object { ConvertTo-ApimNormalizedPolicy -Raw $_ -Kind Live })
+        (Get-ApimPolicyPlan -Desired $desired -Live $live -Prune $true).IsEmpty | Should -BeTrue
+    }
+
+    It 'converges for jwt-validation (string bools/numbers, JSON array, write-only textKey)' {
+        $g = '68ef9520-24e9-4cf2-b2f5-620025690913'
+        $desired = ConvertTo-ApimNormalizedPolicy -Kind Desired -Raw @{
+            assetId = 'jwt-validation'; groupId = $g; version = '1.4.0'
+            configurationData = @{
+                jwtKeyOrigin = 'jwks'; jwksUrl = 'https://login.example.com/oauth2/v1/keys'
+                jwksServiceTimeToLive = 60; skipClientIdValidation = $true
+                validateAudClaim = $true; supportedAudiences = 'api://orders-api'
+                mandatoryExpirationClaim = $true; signingMethod = 'rsa'; signingKeyLength = '256'
+                validateCustomClaim = $false
+                mandatoryCustomClaims = @(@{ key = 'scope'; value = "#[vars.claimSet.scope]" })
+                textKey = 'unused'   # required on apply, never returned by policy list
+            }
+        }
+        $blob = "jwtKeyOrigin: jwks`n" +
+                "jwksUrl: https://login.example.com/oauth2/v1/keys`n" +
+                "jwksServiceTimeToLive: 60`n" +
+                "skipClientIdValidation: true`n" +
+                "validateAudClaim: true`n" +
+                "supportedAudiences: api://orders-api`n" +
+                "mandatoryExpirationClaim: true`n" +
+                "signingMethod: rsa`n" +
+                "signingKeyLength: 256`n" +
+                "validateCustomClaim: false`n" +
+                "mandatoryCustomClaims: [`n  {`n    ""key"": ""scope"",`n    ""value"": ""#[vars.claimSet.scope]""`n  }`n]"
+        $live = ConvertTo-ApimNormalizedPolicy -Kind Live -Raw ([ordered]@{
+            'ID' = 9181999; 'Asset ID' = 'jwt-validation'; 'Asset Version' = '1.4.0'
+            'Status' = 'Enabled'; 'Configuration' = $blob
+        })
+        (Get-ApimPolicyPlan -Desired @($desired) -Live @($live) -Prune $true).IsEmpty | Should -BeTrue
+    }
+
+    It 'still flags a real jwt-validation config drift' {
+        $g = '68ef9520-24e9-4cf2-b2f5-620025690913'
+        $desired = ConvertTo-ApimNormalizedPolicy -Kind Desired -Raw @{
+            assetId = 'jwt-validation'; groupId = $g; version = '1.4.0'
+            configurationData = @{ jwksUrl = 'https://login.example.com/oauth2/v1/keys'; skipClientIdValidation = $true; textKey = 'unused' }
+        }
+        $live = ConvertTo-ApimNormalizedPolicy -Kind Live -Raw ([ordered]@{
+            'ID' = 9181999; 'Asset ID' = 'jwt-validation'; 'Asset Version' = '1.4.0'; 'Status' = 'Enabled'
+            'Configuration' = "jwksUrl: https://OTHER.example.com/keys`nskipClientIdValidation: true"
+        })
+        $plan = Get-ApimPolicyPlan -Desired @($desired) -Live @($live) -Prune $true
+        $plan.Edit.Count | Should -Be 1
+    }
+
+    It 'does not loop on pointcutData the table output cannot report - warns instead' {
+        $g = '68ef9520-24e9-4cf2-b2f5-620025690913'
+        $desired = ConvertTo-ApimNormalizedPolicy -Kind Desired -Raw @{
+            assetId = 'rate-limiting'; groupId = $g; version = '1.4.1'
+            configurationData = @{ a = 1 }
+            pointcutData = @(@{ methodRegex = 'GET'; uriTemplateRegex = '/orders/.*' })
+        }
+        $live = ConvertTo-ApimNormalizedPolicy -Kind Live -Raw ([ordered]@{
+            'ID' = 1; 'Asset ID' = 'rate-limiting'; 'Asset Version' = '1.4.1'; 'Status' = 'Enabled'
+            'Configuration' = 'a: 1'
+        })
+        $plan = Get-ApimPolicyPlan -Desired @($desired) -Live @($live) -Prune $true
+        $plan.IsEmpty | Should -BeTrue
+        ($plan.OrderWarnings -join ' ') | Should -Match 'pointcutData'
+    }
+
+    It 'still compares pointcutData when the live record carries it' {
+        $g = '68ef9520-24e9-4cf2-b2f5-620025690913'
+        $desired = ConvertTo-ApimNormalizedPolicy -Kind Desired -Raw @{
+            assetId = 'rate-limiting'; groupId = $g; version = '1.4.1'
+            configurationData = @{ a = 1 }; pointcutData = @(@{ methodRegex = 'GET' })
+        }
+        $live = ConvertTo-ApimNormalizedPolicy -Kind Live -Raw @{
+            policyId = '1'; template = @{ assetId = 'rate-limiting'; groupId = $g; version = '1.4.1' }
+            configurationData = @{ a = 1 }; pointcut = @(@{ methodRegex = 'POST' })
+        }
+        $plan = Get-ApimPolicyPlan -Desired @($desired) -Live @($live) -Prune $true
+        $plan.Edit.Count | Should -Be 1
+        $plan.Edit[0].Changes | Should -Contain 'pointcut'
     }
 }
 

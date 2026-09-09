@@ -256,9 +256,13 @@ function Read-ApimConfig {
     param([Parameter(Mandatory)][string]$Path)
 
     if (-not (Test-Path -LiteralPath $Path)) { throw "Config file not found: $Path" }
-    $raw = ConvertFrom-Yaml (Get-Content -Raw -LiteralPath $Path) -Ordered
+    # ConvertFrom-Yaml parses JSON too (JSON is valid YAML); one code path for .yaml/.yml/.json.
+    try {
+        $raw = ConvertFrom-Yaml (Get-Content -Raw -LiteralPath $Path) -Ordered
+    }
+    catch { throw "${Path}: could not parse as YAML/JSON - $($_.Exception.Message)" }
     if (($null -eq $raw) -or -not ($raw -is [System.Collections.IDictionary])) {
-        throw "$Path must contain a YAML mapping at the top level"
+        throw "$Path must contain a mapping (object) at the top level"
     }
 
     $inst = Get-DictValue $raw 'apiInstance'
@@ -307,14 +311,17 @@ function Get-ApimConfigList {
 
     if (-not (Test-Path -LiteralPath $ConfigDir)) { throw "Config directory not found: $ConfigDir" }
     $all = Get-ChildItem -LiteralPath $ConfigDir -File |
-        Where-Object { @('.yaml', '.yml') -contains $_.Extension } | Sort-Object Name
+        Where-Object { @('.yaml', '.yml', '.json') -contains $_.Extension } | Sort-Object Name
 
     if ($Api -and $Api -ne 'all') {
-        $match = $all | Where-Object { $_.BaseName -eq $Api } | Select-Object -First 1
+        $match = @($all | Where-Object { $_.BaseName -eq $Api })
         if (-not $match) { throw "No config file for api '$Api' in $ConfigDir" }
-        return , (Read-ApimConfig -Path $match.FullName)
+        if ($match.Count -gt 1) { throw "Multiple config files for api '$Api' in ${ConfigDir}: $($match.Name -join ', ')" }
+        return , (Read-ApimConfig -Path $match[0].FullName)
     }
-    if (-not $all) { throw "No *.yaml config files in $ConfigDir" }
+    if (-not $all) { throw "No *.yaml / *.yml / *.json config files in $ConfigDir" }
+    $dupe = $all | Group-Object BaseName | Where-Object Count -gt 1
+    if ($dupe) { throw "Ambiguous config: $($dupe.Name -join ', ') defined in more than one file under $ConfigDir" }
     return , @($all | ForEach-Object { Read-ApimConfig -Path $_.FullName })
 }
 
@@ -553,23 +560,38 @@ function ConvertTo-ApimNormalizedPolicy {
         $disabled = [bool](Get-DictValue $d 'disabled')
         $config = Get-DictValue $d 'configurationData'
         $pointcut = Get-DictValue $d 'pointcutData'
+        $pointcutKnown = $true
         $instanceId = $null
     }
     else {
+        # `policy list` / `policy describe --output json` return a table-shaped record:
+        #   "ID", "Template ID", "Asset ID", "Asset Version", "Status", "Configuration".
+        # There is no groupId in that shape, so fall back to the MuleSoft standard-policy
+        # groupId (same default the Desired side uses) to keep the match key stable.
         $tmpl = ConvertTo-Dict (Get-DictValue $d 'template')
         $groupId = Get-FirstValue $d @('groupId')
         if (-not $groupId) { $groupId = Get-FirstValue $tmpl @('groupId') }
-        $assetId = Get-FirstValue $d @('assetId', 'policyTemplateId')
+        if (-not $groupId) { $groupId = $script:MuleSoftGroupId }
+        $assetId = Get-FirstValue $d @('assetId', 'policyTemplateId', 'Asset ID')
         if (-not $assetId) { $assetId = Get-FirstValue $tmpl @('assetId') }
-        $version = Get-FirstValue $d @('assetVersion', 'version')
+        $version = Get-FirstValue $d @('assetVersion', 'version', 'Asset Version')
         if (-not $version) { $version = Get-FirstValue $tmpl @('version') }
         $version = "$version"
         $order = Get-DictValue $d 'order'
         $disVal = Get-DictValue $d 'disabled'
-        $disabled = if ($null -eq $disVal) { $false } else { [bool]$disVal }
-        $config = ConvertFrom-ApimConfigBlob (Get-FirstValue $d @('configurationData', 'configuration'))
+        if ($null -ne $disVal) {
+            $disabled = [bool]$disVal
+        }
+        else {
+            $status = Get-FirstValue $d @('Status', 'status')
+            $disabled = ("$status".Trim() -eq 'Disabled')
+        }
+        $config = ConvertFrom-ApimConfigBlob (Get-FirstValue $d @('configurationData', 'configuration', 'Configuration'))
         $pointcut = Get-FirstValue $d @('pointcutData', 'pointcut')
-        $instanceId = Get-FirstValue $d @('policyId', 'id')
+        # The table-shaped `policy list` output carries no pointcut field at all; only
+        # trust a null pointcut if the key was actually present in the record.
+        $pointcutKnown = [bool]($d.Contains('pointcutData') -or $d.Contains('pointcut'))
+        $instanceId = Get-FirstValue $d @('policyId', 'id', 'ID')
     }
 
     [pscustomobject]@{
@@ -582,14 +604,16 @@ function ConvertTo-ApimNormalizedPolicy {
         Config       = $config
         Pointcut     = $pointcut
         PointcutJson = (ConvertTo-CanonicalJson $pointcut)
+        PointcutKnown = $pointcutKnown
         InstanceId   = if ($null -ne $instanceId) { "$instanceId" } else { $null }
     }
 }
 
 function ConvertFrom-ApimConfigBlob {
-    <# `policy list` returns some policy configs as a newline-delimited "key: value"
-       string instead of an object. Parse that into a dict so it can be compared.
-       Non-strings and already-structured values pass through unchanged. #>
+    <# `policy list` renders some configs as a newline record list ("key: value", where
+       a value may be multi-line JSON) instead of an object. Parse it into a dict.
+       This is NOT YAML: a leading '#' in a value (DataWeave "#[...]") is literal, not a
+       comment. Non-strings and real JSON objects pass through unchanged. #>
     param($Config)
     if ($Config -isnot [string]) { return $Config }
     $t = $Config.Trim()
@@ -597,15 +621,31 @@ function ConvertFrom-ApimConfigBlob {
     if ($t.StartsWith('{') -or $t.StartsWith('[')) {
         try { return ($t | ConvertFrom-Json) } catch { return $Config }
     }
-    $h = [ordered]@{}
+
+    # A record starts at a line like "<identifier>: ..."; other lines continue the
+    # previous value (e.g. a pretty-printed JSON array spanning several lines).
+    $records = [ordered]@{}
+    $key = $null
     foreach ($line in ($t -split "`r?`n")) {
-        $i = $line.IndexOf(':')
-        if ($i -lt 1) { continue }
-        $key = $line.Substring(0, $i).Trim()
-        if ($key) { $h[$key] = $line.Substring($i + 1).Trim() }
+        if ($line -match '^([A-Za-z_][\w.\-]*)\s*:\s?(.*)$') {
+            $key = $Matches[1]
+            $records[$key] = $Matches[2]
+        }
+        elseif ($null -ne $key) {
+            $records[$key] = "$($records[$key])`n$line"
+        }
     }
-    if ($h.Count -eq 0) { return $Config }
-    return $h
+    if ($records.Count -eq 0) { return $Config }
+
+    $out = [ordered]@{}
+    foreach ($k in $records.Keys) {
+        $v = "$($records[$k])".Trim()
+        if ($v.StartsWith('{') -or $v.StartsWith('[')) {
+            try { $out[$k] = ($v | ConvertFrom-Json); continue } catch { }
+        }
+        $out[$k] = $v
+    }
+    return $out
 }
 
 function Remove-ApimIgnoredConfigKey {
@@ -641,7 +681,15 @@ function Get-ApimPolicyPlan {
         $dCfg = Remove-ApimIgnoredConfigKey $dp.Config $dp.Key
         $lCfg = Remove-ApimIgnoredConfigKey $lp.Config $lp.Key
         $cfgEqual = Test-ApimConfigTreeEqual $dCfg $lCfg
-        $pcEqual = ($dp.PointcutJson -eq $lp.PointcutJson)
+        if ($lp.PointcutKnown) {
+            $pcEqual = ($dp.PointcutJson -eq $lp.PointcutJson)
+        }
+        else {
+            $pcEqual = $true   # `policy list` does not return the pointcut - cannot compare
+            if ($dp.PointcutJson -ne 'null') {
+                $orderWarn += "$($dp.AssetId): pointcutData is set in config but 'policy list' does not return it (cannot verify or reconcile the pointcut)"
+            }
+        }
         if (-not ($cfgEqual -and $pcEqual)) {
             $changes = @()
             if (-not $cfgEqual) {
@@ -870,9 +918,14 @@ function Export-ApimConfig {
     }
     if (-not $newRaw.Contains('policies')) { $newRaw['policies'] = $entries }
 
-    $header = "# Managed by apim-sync. 'extract' overwrites the policies list from the live $Environment instance;`n" +
-              "# other sections are preserved. Review before merging.`n"
-    $text = $header + (ConvertTo-Yaml $newRaw)
+    if ([System.IO.Path]::GetExtension($Config.Path) -eq '.json') {
+        $text = ($newRaw | ConvertTo-Json -Depth 40)   # JSON has no comments; emit the object only
+    }
+    else {
+        $header = "# Managed by apim-sync. 'extract' overwrites the policies list from the live $Environment instance;`n" +
+                  "# other sections are preserved. Review before merging.`n"
+        $text = $header + (ConvertTo-Yaml $newRaw)
+    }
 
     $current = if (Test-Path -LiteralPath $Config.Path) { Get-Content -Raw -LiteralPath $Config.Path } else { '' }
     $changed = ($current -ne $text)
