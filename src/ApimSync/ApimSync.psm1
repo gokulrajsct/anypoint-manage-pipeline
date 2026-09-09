@@ -13,6 +13,13 @@ $script:DeploymentTypeMap = @{
     'cloudhub2' = 'cloudhub2'; 'cloudhub' = 'cloudhub'; 'hybrid' = 'hybrid'; 'rtf' = 'rtf'
 }
 
+# REST read path state (per process). ApimApiContext maps an API instance id to the
+# org/env ids seen on the `api list` / `api manage` / `api promote` response, so the
+# policies endpoint can be built without an extra lookup.
+$script:ApimApiContext = @{}
+$script:ApimToken = $null
+$script:ApimOrgId = $null
+
 # configurationData keys excluded from the desired-vs-live diff (top level only) so
 # reconcile can converge. Two reasons a key lands here:
 #   - required on `policy apply` but never echoed by `policy list` (e.g. jwt-validation textKey)
@@ -401,9 +408,19 @@ function Get-ApimInstanceId {
 
     foreach ($i in $items) {
         $label = if ($i.PSObject.Properties['instanceLabel']) { $i.instanceLabel } else { $null }
-        if ($label -eq $InstanceLabel) { return "$($i.id)" }
+        if ($label -eq $InstanceLabel) { Set-ApimApiContext $i; return "$($i.id)" }
     }
     return $null
+}
+
+function Set-ApimApiContext {
+    <# Remember org/env ids from an API object so the REST policies call needs no extra lookup. #>
+    param($ApiObject)
+    $id = Get-DictValue $ApiObject 'id'
+    if (-not $id) { return }
+    $org = Get-DictValue $ApiObject 'organizationId'
+    $envId = Get-DictValue $ApiObject 'environmentId'
+    if ($org -or $envId) { $script:ApimApiContext["$id"] = @{ OrgId = "$org"; EnvId = "$envId" } }
 }
 
 function Get-CliDeploymentType {
@@ -437,6 +454,7 @@ function New-ApimInstance {
     $args += @('--apiInstanceLabel', "$($inst.instanceLabel)")
 
     $res = Invoke-AnypointCli -ArgumentList $args -AsJson
+    Set-ApimApiContext $res
     return "$($res.id)"
 }
 
@@ -456,11 +474,88 @@ function Invoke-ApimPromotion {
         '--copyAlerts', (& $b (Get-DictValue $p 'copyAlerts')),
         '--output', 'json')
     $res = Invoke-AnypointCli -ArgumentList $args -AsJson
+    Set-ApimApiContext $res
     return "$($res.id)"
+}
+
+# --------------------------------------------------------------------------- #
+# Anypoint Platform REST (used for the policy read - returns structured
+# configurationData, unlike `anypoint-cli policy list`'s stringified table).
+# --------------------------------------------------------------------------- #
+function Get-ApimBaseUri {
+    $apiHost = if ($env:ANYPOINT_HOST) { "$($env:ANYPOINT_HOST)".Trim() } else { 'anypoint.mulesoft.com' }
+    $apiHost = ($apiHost -replace '^https?://', '') -replace '/+$', ''
+    return "https://$apiHost"
+}
+
+function Get-ApimAccessToken {
+    <# client_credentials grant using the connected-app creds the CLI already uses. Cached. #>
+    if ($script:ApimToken -and ($script:ApimToken.Expires -gt (Get-Date).AddSeconds(60))) {
+        return $script:ApimToken.Value
+    }
+    $cid = "$($env:ANYPOINT_CLIENT_ID)"; $sec = "$($env:ANYPOINT_CLIENT_SECRET)"
+    if (-not $cid -or -not $sec) {
+        throw "ANYPOINT_CLIENT_ID / ANYPOINT_CLIENT_SECRET are required for the REST policy read (or set APIM_POLICY_READ=cli)"
+    }
+    $uri = "$(Get-ApimBaseUri)/accounts/api/v2/oauth2/token"
+    Write-Host "[anypoint-rest] POST $uri (client_credentials)"
+    $resp = Invoke-RestMethod -Method Post -Uri $uri -ErrorAction Stop `
+        -ContentType 'application/x-www-form-urlencoded' `
+        -Body @{ grant_type = 'client_credentials'; client_id = $cid; client_secret = $sec }
+    if (-not $resp.access_token) { throw "token endpoint returned no access_token" }
+    $ttl = if ($resp.PSObject.Properties['expires_in'] -and $resp.expires_in) { [int]$resp.expires_in } else { 3600 }
+    $script:ApimToken = @{ Value = "$($resp.access_token)"; Expires = (Get-Date).AddSeconds($ttl) }
+    Write-Host "[anypoint-rest] token acquired (expires in ${ttl}s)"
+    return $script:ApimToken.Value
+}
+
+function Invoke-ApimRest {
+    param([Parameter(Mandatory)][string]$Method, [Parameter(Mandatory)][string]$Uri, [hashtable]$Headers)
+    Write-Host "[anypoint-rest] $Method $Uri"
+    try {
+        $resp = Invoke-RestMethod -Method $Method -Uri $Uri -Headers $Headers -ErrorAction Stop
+    }
+    catch {
+        Write-Host "[anypoint-rest] ERROR $($_.Exception.Message)"
+        throw
+    }
+    if ($null -ne $resp) { Write-Host "[anypoint-rest] response:`n$($resp | ConvertTo-Json -Depth 15)" }
+    return $resp
+}
+
+function Get-ApimOrgId {
+    if ($script:ApimOrgId) { return $script:ApimOrgId }
+    $org = "$($env:ANYPOINT_ORG)"
+    if ($org -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') { $script:ApimOrgId = $org; return $org }
+    foreach ($c in $script:ApimApiContext.Values) {
+        if ($c.OrgId) { $script:ApimOrgId = $c.OrgId; return $c.OrgId }
+    }
+    throw "Cannot resolve the organization id for the REST call - set ANYPOINT_ORG to the business group id (GUID), or set APIM_POLICY_READ=cli"
+}
+
+function Get-ApimAppliedPolicyViaRest {
+    param([Parameter(Mandatory)][string]$EnvName, [Parameter(Mandatory)][string]$InstanceId)
+    $ctx = $script:ApimApiContext["$InstanceId"]
+    $orgId = if ($ctx -and $ctx.OrgId) { $ctx.OrgId } else { Get-ApimOrgId }
+    $envId = if ($ctx -and $ctx.EnvId) { $ctx.EnvId } else { Get-ApimEnvironmentId -EnvName $EnvName }
+    $uri = "$(Get-ApimBaseUri)/apimanager/api/v1/organizations/$orgId/environments/$envId/apis/$InstanceId/policies"
+    $resp = Invoke-ApimRest -Method Get -Uri $uri -Headers @{ Authorization = "Bearer $(Get-ApimAccessToken)" }
+    if ($null -eq $resp) { return , [object[]]@() }
+    if ($resp -is [System.Array]) { return , [object[]]@($resp) }
+    if ($resp.PSObject.Properties['policies']) { return , [object[]]@($resp.policies) }
+    return , [object[]]@($resp)
 }
 
 function Get-ApimAppliedPolicy {
     param([Parameter(Mandatory)][string]$EnvName, [Parameter(Mandatory)][string]$InstanceId)
+
+    if ("$($env:APIM_POLICY_READ)".ToLower() -ne 'cli') {
+        try {
+            $rest = Get-ApimAppliedPolicyViaRest -EnvName $EnvName -InstanceId $InstanceId
+            return , [object[]]@($rest)
+        }
+        catch { Write-Warning "[anypoint-rest] policy read failed, falling back to anypoint-cli: $($_.Exception.Message)" }
+    }
     $res = Invoke-AnypointCli -AsJson -ArgumentList @(
         'api-mgr', 'policy', 'list', $InstanceId, '--muleVersion4OrAbove',
         '--environment', $EnvName, '--output', 'json')
@@ -619,7 +714,7 @@ function ConvertFrom-ApimConfigBlob {
     $t = $Config.Trim()
     if ($t -eq '') { return $Config }
     if ($t.StartsWith('{') -or $t.StartsWith('[')) {
-        try { return ($t | ConvertFrom-Json) } catch { return $Config }
+        try { return (ConvertFrom-ApimJsonValue $t) } catch { return $Config }
     }
 
     # A record starts at a line like "<identifier>: ..."; other lines continue the
@@ -641,11 +736,21 @@ function ConvertFrom-ApimConfigBlob {
     foreach ($k in $records.Keys) {
         $v = "$($records[$k])".Trim()
         if ($v.StartsWith('{') -or $v.StartsWith('[')) {
-            try { $out[$k] = ($v | ConvertFrom-Json); continue } catch { }
+            try { $out[$k] = (ConvertFrom-ApimJsonValue $v); continue } catch { }
         }
         $out[$k] = $v
     }
     return $out
+}
+
+function ConvertFrom-ApimJsonValue {
+    <# ConvertFrom-Json unwraps a single-element JSON array to a scalar; keep the array
+       shape so "[ {one object} ]" stays comparable to a desired one-element list. #>
+    param([string]$Json)
+    $parsed = $Json | ConvertFrom-Json
+    if (-not $Json.TrimStart().StartsWith('[')) { return $parsed }
+    if ($null -eq $parsed) { return , [object[]]@() }
+    return , [object[]]@($parsed)
 }
 
 function Remove-ApimIgnoredConfigKey {
@@ -971,5 +1076,6 @@ Export-ModuleMember -Function @(
     'Get-ApimConfigTreeDiff', 'ConvertFrom-ApimConfigBlob',
     'Write-ApimPlan', 'Invoke-AnypointCli', 'Resolve-ApimEnvironmentName',
     'Get-ApimEnvironmentId', 'Get-ApimInstanceId', 'Get-ApimAppliedPolicy',
+    'Get-ApimAppliedPolicyViaRest', 'Get-ApimBaseUri', 'Get-ApimAccessToken',
     'New-ApimInstance', 'Invoke-ApimPromotion', 'Get-ApimInitialEnv'
 )

@@ -154,12 +154,28 @@ Describe 'ConvertFrom-ApimConfigBlob' {
         $r['credentialsOriginHasHttpBasicAuthenticationHeader'] | Should -Be 'customExpression'
     }
 
-    It 'reassembles a multi-line JSON value' {
+    It 'reassembles a multi-line JSON value and keeps a one-element array an array' {
         $blob = "clusterizable: true`nexposeHeaders: false`nrateLimits: [`n  {`n    ""maximumRequests"": 100,`n    ""timePeriodInMilliseconds"": 60000`n  }`n]"
         $r = ConvertFrom-ApimConfigBlob $blob
         $r['clusterizable'] | Should -Be 'true'
-        @($r['rateLimits']).Count | Should -Be 1
+        ,$r['rateLimits'] | Should -BeOfType [System.Object[]]   # not unwrapped to a bare object
+        $r['rateLimits'].Count | Should -Be 1
         $r['rateLimits'][0].maximumRequests | Should -Be 100
+    }
+
+    It 'a one-element rateLimits list converges (regression: single-element array unwrap)' {
+        $g = '68ef9520-24e9-4cf2-b2f5-620025690913'
+        $blob = "clusterizable: true`nexposeHeaders: false`nrateLimits: [`n  {`n    ""maximumRequests"": 100,`n    ""timePeriodInMilliseconds"": 60000`n  }`n]"
+        $desired = ConvertTo-ApimNormalizedPolicy -Kind Desired -Raw @{
+            assetId = 'rate-limiting'; groupId = $g; version = '1.4.1'
+            configurationData = @{ clusterizable = $true; exposeHeaders = $false
+                rateLimits = @(@{ maximumRequests = 100; timePeriodInMilliseconds = 60000 }) }
+        }
+        $live = ConvertTo-ApimNormalizedPolicy -Kind Live -Raw ([ordered]@{
+            'ID' = 9181953; 'Asset ID' = 'rate-limiting'; 'Asset Version' = '1.4.1'
+            'Status' = 'Enabled'; 'Configuration' = $blob
+        })
+        (Get-ApimPolicyPlan -Desired @($desired) -Live @($live) -Prune $true).IsEmpty | Should -BeTrue
     }
 
     It 'passes structured input through unchanged' {
@@ -303,6 +319,75 @@ Describe 'ConvertTo-ApimNormalizedPolicy - table-shaped live (policy list / desc
         $plan = Get-ApimPolicyPlan -Desired @($desired) -Live @($live) -Prune $true
         $plan.Edit.Count | Should -Be 1
         $plan.Edit[0].Changes | Should -Contain 'pointcut'
+    }
+}
+
+Describe 'Get-ApimAppliedPolicy - REST read path' {
+
+    BeforeEach {
+        $env:APIM_POLICY_READ = $null
+        Mock -ModuleName ApimSync Get-ApimAccessToken { 'tok-123' }
+        Mock -ModuleName ApimSync Get-ApimOrgId { 'ORG-1' }
+        Mock -ModuleName ApimSync Get-ApimEnvironmentId { 'ENV-1' }
+        Mock -ModuleName ApimSync Invoke-AnypointCli { throw 'CLI should not be called' }
+    }
+
+    It 'reads policies from the REST endpoint (structured configurationData, no blob)' {
+        Mock -ModuleName ApimSync Invoke-ApimRest {
+            @(
+                [pscustomobject]@{ id = 9181953
+                    template = [pscustomobject]@{ groupId = '68ef9520-24e9-4cf2-b2f5-620025690913'; assetId = 'rate-limiting'; version = '1.4.1' }
+                    configurationData = [pscustomobject]@{ clusterizable = $true; rateLimits = @([pscustomobject]@{ maximumRequests = 100 }) }
+                    pointcutData = $null; order = 1; disabled = $false }
+            )
+        }
+        $live = Get-ApimAppliedPolicy -EnvName 'Test' -InstanceId '9181953'
+        $live.Count | Should -Be 1
+        $n = ConvertTo-ApimNormalizedPolicy -Raw $live[0] -Kind Live
+        $n.AssetId | Should -Be 'rate-limiting'
+        $n.Config.rateLimits[0].maximumRequests | Should -Be 100   # real object, not a blob
+        Should -Invoke -ModuleName ApimSync Invoke-ApimRest -Times 1
+    }
+
+    It 'builds the policies URL from org / env / api ids' {
+        Mock -ModuleName ApimSync Invoke-ApimRest { @() }
+        Get-ApimAppliedPolicy -EnvName 'Test' -InstanceId '777' | Out-Null
+        Should -Invoke -ModuleName ApimSync Invoke-ApimRest -ParameterFilter {
+            $Uri -eq 'https://anypoint.mulesoft.com/apimanager/api/v1/organizations/ORG-1/environments/ENV-1/apis/777/policies'
+        }
+    }
+
+    It 'falls back to the CLI when the REST call fails' {
+        Mock -ModuleName ApimSync Invoke-ApimRest { throw 'boom (401)' }
+        Mock -ModuleName ApimSync Invoke-AnypointCli {
+            @([pscustomobject]@{ ID = 1; 'Asset ID' = 'rate-limiting'; 'Asset Version' = '1.4.1'; 'Status' = 'Enabled'; 'Configuration' = 'clusterizable: true' })
+        }
+        $live = Get-ApimAppliedPolicy -EnvName 'Test' -InstanceId '1' 3>$null
+        $live.Count | Should -Be 1
+        Should -Invoke -ModuleName ApimSync Invoke-AnypointCli -Times 1
+    }
+
+    It 'APIM_POLICY_READ=cli skips REST entirely' {
+        $env:APIM_POLICY_READ = 'cli'
+        Mock -ModuleName ApimSync Invoke-ApimRest { throw 'REST must not be called' }
+        Mock -ModuleName ApimSync Invoke-AnypointCli { @() }
+        Get-ApimAppliedPolicy -EnvName 'Test' -InstanceId '1' | Out-Null
+        Should -Invoke -ModuleName ApimSync Invoke-ApimRest -Times 0
+        Should -Invoke -ModuleName ApimSync Invoke-AnypointCli -Times 1
+        $env:APIM_POLICY_READ = $null
+    }
+}
+
+Describe 'Get-ApimBaseUri' {
+    AfterEach { $env:ANYPOINT_HOST = $null }
+
+    It 'defaults to the US control plane' {
+        $env:ANYPOINT_HOST = $null
+        Get-ApimBaseUri | Should -Be 'https://anypoint.mulesoft.com'
+    }
+    It 'honours ANYPOINT_HOST and strips scheme / trailing slash' {
+        $env:ANYPOINT_HOST = 'https://eu1.anypoint.mulesoft.com/'
+        Get-ApimBaseUri | Should -Be 'https://eu1.anypoint.mulesoft.com'
     }
 }
 

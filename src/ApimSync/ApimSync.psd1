@@ -12,6 +12,7 @@
         'Get-ApimConfigTreeDiff', 'ConvertFrom-ApimConfigBlob',
         'Write-ApimPlan', 'Invoke-AnypointCli', 'Resolve-ApimEnvironmentName',
         'Get-ApimEnvironmentId', 'Get-ApimInstanceId', 'Get-ApimAppliedPolicy',
+        'Get-ApimAppliedPolicyViaRest', 'Get-ApimBaseUri', 'Get-ApimAccessToken',
         'New-ApimInstance', 'Invoke-ApimPromotion', 'Get-ApimInitialEnv'
     )
     CmdletsToExport   = @()

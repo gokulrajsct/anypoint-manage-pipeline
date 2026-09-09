@@ -86,10 +86,20 @@ policies:
       rateLimits: [{ maximumRequests: 200, timePeriodInMilliseconds: 60000 }]
 ```
 
-**Masked secrets:** `api-mgr policy list` returns sensitive `configurationData` values
-masked (`********`). The engine ignores masked fields when diffing (so they never look
-like drift) and, on `extract`, keeps the value already present in the YAML. A real change
-to a secret must be made in the config file.
+**Config files** may be YAML (`.yaml` / `.yml`) or JSON (`.json`) — one file per API per
+environment, the file stem is the API key. Don't define the same stem twice in a dir.
+
+**Live policy read:** the engine reads applied policies from the **Anypoint Platform REST
+API** (`GET …/apimanager/api/v1/organizations/{org}/environments/{env}/apis/{id}/policies`),
+using a `client_credentials` token from the same `ANYPOINT_CLIENT_ID` / `ANYPOINT_CLIENT_SECRET`.
+This returns a structured `configurationData` object. If the REST call fails it falls back to
+`anypoint-cli-v4 api-mgr policy list` (whose `--output json` is a stringified table that the
+engine parses best-effort). Set `APIM_POLICY_READ=cli` to force the CLI path.
+
+**Masked secrets:** sensitive `configurationData` values come back masked (`********`). The
+engine ignores masked fields when diffing (so they never look like drift) and, on `extract`,
+keeps the value already present in the config file. A real change to a secret must be made in
+the config file.
 
 ---
 
@@ -176,12 +186,14 @@ Against a real sandbox — copy `local/.env.example` to `local/.env`, fill it, t
 |---|---|
 | `Invoke-ApimSync.ps1` | entry point: `reconcile` / `extract` / `validate` / `login-check` |
 | `src/ApimSync/ApimSync.psm1` | the module — everything below |
-| &nbsp;&nbsp;`Read-ApimConfig`, `Get-ApimConfigList` | load + validate config YAML |
+| &nbsp;&nbsp;`Read-ApimConfig`, `Get-ApimConfigList` | load + validate config (YAML or JSON) |
 | &nbsp;&nbsp;`ConvertTo-ApimNormalizedPolicy` | normalise desired / live policy to a comparable shape |
-| &nbsp;&nbsp;`Test-ApimConfigTreeEqual` | deep config compare, mask-aware |
+| &nbsp;&nbsp;`ConvertFrom-ApimConfigBlob` | parse the CLI's stringified `Configuration` table cell (fallback path) |
+| &nbsp;&nbsp;`Test-ApimConfigTreeEqual` / `Get-ApimConfigTreeDiff` | deep config compare + per-field diff log, mask-aware |
 | &nbsp;&nbsp;`Get-ApimPolicyPlan` | desired vs live → Add / Edit / Remove / Toggle / Drift plan |
 | &nbsp;&nbsp;`Invoke-AnypointCli` | run `anypoint-cli-v4`, capture JSON, surface errors |
-| &nbsp;&nbsp;`Get-ApimInstanceId` / `New-ApimInstance` / `Invoke-ApimPromotion` / `Get-ApimAppliedPolicy` / `Add`/`Set`/`Remove-ApimPolicy` | CLI wrappers |
+| &nbsp;&nbsp;`Get-ApimAccessToken` / `Invoke-ApimRest` / `Get-ApimAppliedPolicyViaRest` | REST read path (token + policies GET) |
+| &nbsp;&nbsp;`Get-ApimInstanceId` / `New-ApimInstance` / `Invoke-ApimPromotion` / `Get-ApimAppliedPolicy` / `Add`/`Set`/`Remove-ApimPolicy` | CLI wrappers (`Get-ApimAppliedPolicy` = REST with CLI fallback) |
 | &nbsp;&nbsp;`Invoke-ApimReconcile` | orchestration: exists? → create/promote → apply plan → verify |
 | &nbsp;&nbsp;`Export-ApimConfig` | live policies → config-file `policies:` list (dev only) |
 | &nbsp;&nbsp;`Invoke-ApimConfigCommit` | stage / commit / push updated config files |
