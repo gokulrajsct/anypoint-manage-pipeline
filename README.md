@@ -195,7 +195,7 @@ Against a real sandbox — copy `local/.env.example` to `local/.env`, fill it, t
 | &nbsp;&nbsp;`Get-ApimAccessToken` / `Invoke-ApimRest` / `Get-ApimAppliedPolicyViaRest` | REST read path (token + policies GET) |
 | &nbsp;&nbsp;`Get-ApimInstanceId` / `New-ApimInstance` / `Invoke-ApimPromotion` / `Get-ApimAppliedPolicy` / `Add`/`Set`/`Remove-ApimPolicy` | CLI wrappers (`Get-ApimAppliedPolicy` = REST with CLI fallback) |
 | &nbsp;&nbsp;`Invoke-ApimReconcile` | orchestration: exists? → create/promote → apply plan → verify |
-| &nbsp;&nbsp;`Export-ApimConfig` | live policies → config-file `policies:` list (dev only) |
+| &nbsp;&nbsp;`Export-ApimConfig` | live policies (same REST read) → config-file `policies:` list; drops read-artifact keys, keeps/`CHANGE_ME`-stubs apply-only keys like jwt-validation `textKey` |
 | &nbsp;&nbsp;`Invoke-ApimConfigCommit` | stage / commit / push updated config files |
 
 ### Exit codes

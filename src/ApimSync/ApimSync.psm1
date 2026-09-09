@@ -114,6 +114,24 @@ function ConvertTo-CanonicalJson {
     return ($canon | ConvertTo-Json -Depth 40 -Compress)
 }
 
+function ConvertTo-ApimPointcutArray {
+    <# API Manager pointcutData is always a JSON array. Wrap a lone mapping in one. #>
+    param($Pointcut)
+    if ($null -eq $Pointcut) { return $null }
+    $arr = ConvertTo-Arr $Pointcut
+    if ($null -ne $arr) { return , [object[]]@($arr) }
+    return , [object[]]@($Pointcut)
+}
+
+function ConvertTo-ApimPointcutJson {
+    <# Canonical JSON *array* text for --pointcut and for comparison. ConvertTo-Json unwraps
+       a one-element array, so build the brackets by hand. #>
+    param($Pointcut)
+    $arr = ConvertTo-ApimPointcutArray $Pointcut
+    if ($null -eq $arr) { return 'null' }
+    return '[' + (($arr | ForEach-Object { ConvertTo-CanonicalJson $_ }) -join ',') + ']'
+}
+
 function Test-ApimConfigTreeEqual {
     <# True when Desired would be a no-op against Live: every key/value in Desired must
        match Live. Keys present only on Live are ignored (the live policy carries defaults
@@ -583,8 +601,8 @@ function Add-ApimPolicy {
         $args = @('api-mgr', 'policy', 'apply', $InstanceId, $Policy.AssetId,
             '--policyVersion', $Policy.Version, '--groupId', $Policy.GroupId,
             '--configFile', $cfgFile, '--environment', $EnvName, '--output', 'json')
-        if ($Policy.Pointcut) {
-            $args += @('--pointcut', (ConvertTo-Json $Policy.Pointcut -Depth 20 -Compress))
+        if ($Policy.PointcutJson -and $Policy.PointcutJson -ne 'null') {
+            $args += @('--pointcut', $Policy.PointcutJson)
         }
         $res = Invoke-AnypointCli -ArgumentList $args -AsJson
     }
@@ -610,7 +628,7 @@ function Set-ApimPolicy {
         $args = @('api-mgr', 'policy', 'edit', $InstanceId, $PolicyInstanceId,
             '--configFile', $cfgFile, '--environment', $EnvName, '--output', 'json')
         if ($Changes -contains 'pointcut') {
-            $pc = if ($Policy.Pointcut) { ConvertTo-Json $Policy.Pointcut -Depth 20 -Compress } else { 'null' }
+            $pc = if ($Policy.PointcutJson) { $Policy.PointcutJson } else { 'null' }
             $args += @('--pointcut', $pc)
         }
         Invoke-AnypointCli -ArgumentList $args -AsJson | Out-Null
@@ -656,7 +674,7 @@ function ConvertTo-ApimNormalizedPolicy {
         $order = Get-DictValue $d 'order'
         $disabled = [bool](Get-DictValue $d 'disabled')
         $config = Get-DictValue $d 'configurationData'
-        $pointcut = Get-DictValue $d 'pointcutData'
+        $pointcut = ConvertTo-ApimPointcutArray (Get-DictValue $d 'pointcutData')
         $pointcutKnown = $true
         $instanceId = $null
     }
@@ -687,7 +705,7 @@ function ConvertTo-ApimNormalizedPolicy {
             $disabled = ("$status".Trim() -eq 'Disabled')
         }
         $config = ConvertFrom-ApimConfigBlob (Get-FirstValue $d @('configurationData', 'configuration', 'Configuration'))
-        $pointcut = Get-FirstValue $d @('pointcutData', 'pointcut')
+        $pointcut = ConvertTo-ApimPointcutArray (Get-FirstValue $d @('pointcutData', 'pointcut'))
         # The table-shaped `policy list` output carries no pointcut field at all; only
         # trust a null pointcut if the key was actually present in the record.
         $pointcutKnown = [bool]($d.Contains('pointcutData') -or $d.Contains('pointcut'))
@@ -703,7 +721,7 @@ function ConvertTo-ApimNormalizedPolicy {
         Disabled     = $disabled
         Config       = $config
         Pointcut     = $pointcut
-        PointcutJson = (ConvertTo-CanonicalJson $pointcut)
+        PointcutJson = (ConvertTo-ApimPointcutJson $pointcut)
         PointcutKnown = $pointcutKnown
         InstanceId   = if ($null -ne $instanceId) { "$instanceId" } else { $null }
     }
@@ -993,16 +1011,28 @@ function Export-ApimConfig {
         $prior = if ($existingByKey.ContainsKey($n.Key)) { $existingByKey[$n.Key] } else { $null }
         $priorCfg = if ($prior) { Get-DictValue $prior 'configurationData' } else { $null }
         $restored = Restore-ApimMaskedValue (ConvertTo-CanonicalObject $n.Config) $priorCfg
-        # carry over apply-only keys (e.g. jwt-validation textKey) that `policy list` never returns
-        $ignore = $script:PolicyConfigDiffIgnore[$n.Key]
-        if ($ignore -and $priorCfg) {
-            $rd = ConvertTo-Dict $restored; $pd = ConvertTo-Dict $priorCfg
-            if (($null -ne $rd) -and ($null -ne $pd)) {
-                foreach ($ik in $ignore) {
-                    if (-not $rd.Contains($ik) -and $pd.Contains($ik)) { $rd["$ik"] = $pd["$ik"] }
-                }
-                $restored = ConvertTo-CanonicalObject $rd
+        # Make the written configurationData match what `reconcile` expects:
+        #  - drop keys the read injects but config never sets (assetId / assetVersion / ...)
+        #  - keep apply-only keys the read never returns (jwt-validation textKey): take them
+        #    from the existing config file, else write a placeholder to fix before applying
+        $rd = ConvertTo-Dict $restored
+        if ($null -ne $rd) {
+            $pd = ConvertTo-Dict $priorCfg
+            $kept = [ordered]@{}
+            foreach ($k in $rd.Keys) {
+                if ($script:PolicyConfigDiffIgnoreCommon -notcontains "$k") { $kept["$k"] = $rd["$k"] }
             }
+            foreach ($ik in @($script:PolicyConfigDiffIgnore[$n.Key] | Where-Object { $_ })) {
+                if ($kept.Contains($ik)) { continue }
+                if (($null -ne $pd) -and $pd.Contains($ik)) {
+                    $kept[$ik] = $pd[$ik]
+                }
+                else {
+                    $kept[$ik] = 'CHANGE_ME'
+                    $warnings += "$($n.AssetId): '$ik' is required on apply but not returned by the API - wrote a placeholder, set it before applying."
+                }
+            }
+            $restored = ConvertTo-CanonicalObject $kept
         }
         if ((ConvertTo-CanonicalJson $restored) -match '\*{3,}') {
             $warnings += "$($n.AssetId): a masked value has no prior in the config file - left as placeholder, edit before committing."

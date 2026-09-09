@@ -332,6 +332,23 @@ Describe 'ConvertTo-ApimNormalizedPolicy - table-shaped live (policy list / desc
         $plan.Edit.Count | Should -Be 1
         $plan.Edit[0].Changes | Should -Contain 'pointcut'
     }
+
+    It 'normalises a lone pointcut mapping to a JSON array (CLI requires an array)' {
+        $g = '68ef9520-24e9-4cf2-b2f5-620025690913'
+        $desired = ConvertTo-ApimNormalizedPolicy -Kind Desired -Raw @{
+            assetId = 'jwt-validation'; groupId = $g; version = '1.4.0'
+            configurationData = @{ jwksUrl = 'https://idp/keys' }
+            pointcutData = @{ methodRegex = 'GET'; uriTemplateRegex = '/enrol/.*' }   # a bare mapping
+        }
+        $desired.PointcutJson | Should -Be '[{"methodRegex":"GET","uriTemplateRegex":"/enrol/.*"}]'
+        # matches a live policy whose REST payload already has it as a one-element array
+        $live = ConvertTo-ApimNormalizedPolicy -Kind Live -Raw ([pscustomobject]@{
+            policyId = 9; template = [pscustomobject]@{ groupId = $g; assetId = 'jwt-validation'; assetVersion = '1.4.0' }
+            configuration = [pscustomobject]@{ jwksUrl = 'https://idp/keys' }
+            pointcutData = @([pscustomobject]@{ methodRegex = 'GET'; uriTemplateRegex = '/enrol/.*' })
+        })
+        (Get-ApimPolicyPlan -Desired @($desired) -Live @($live) -Prune $true).IsEmpty | Should -BeTrue
+    }
 }
 
 Describe 'ConvertTo-ApimNormalizedPolicy - REST policy shape' {
@@ -368,6 +385,93 @@ Describe 'ConvertTo-ApimNormalizedPolicy - REST policy shape' {
             }
         })
         (Get-ApimPolicyPlan -Desired @($desired) -Live @($live) -Prune $true).IsEmpty | Should -BeTrue
+    }
+}
+
+Describe 'pointcutData normalisation' {
+    BeforeAll { $script:g = '68ef9520-24e9-4cf2-b2f5-620025690913' }
+
+    It 'a lone mapping becomes a one-element array' {
+        $n = ConvertTo-ApimNormalizedPolicy -Kind Desired -Raw @{
+            assetId = 'jwt-validation'; groupId = $g; version = '1.4.0'; configurationData = @{ a = 1 }
+            pointcutData = @{ methodRegex = 'GET'; uriTemplateRegex = '/enrol/.*' }
+        }
+        $n.Pointcut.Count      | Should -Be 1
+        $n.PointcutJson        | Should -Be '[{"methodRegex":"GET","uriTemplateRegex":"/enrol/.*"}]'
+    }
+
+    It 'multiple pointcut objects keep their order and shape' {
+        $n = ConvertTo-ApimNormalizedPolicy -Kind Desired -Raw @{
+            assetId = 'jwt-validation'; groupId = $g; version = '1.4.0'; configurationData = @{ a = 1 }
+            pointcutData = @(
+                @{ methodRegex = 'GET';  uriTemplateRegex = '/enrol/student/.*' }
+                @{ methodRegex = 'POST'; uriTemplateRegex = '/enrol/admin/.*' }
+            )
+        }
+        $n.Pointcut.Count | Should -Be 2
+        $n.PointcutJson   | Should -Be '[{"methodRegex":"GET","uriTemplateRegex":"/enrol/student/.*"},{"methodRegex":"POST","uriTemplateRegex":"/enrol/admin/.*"}]'
+    }
+
+    It 'Add-ApimPolicy sends the multi-entry pointcut as a JSON array to the CLI' {
+        InModuleScope ApimSync {
+            $g = '68ef9520-24e9-4cf2-b2f5-620025690913'
+            Mock Invoke-AnypointCli { [pscustomobject]@{ policyId = 1 } }
+            $pol = ConvertTo-ApimNormalizedPolicy -Kind Desired -Raw @{
+                assetId = 'jwt-validation'; groupId = $g; version = '1.4.0'; configurationData = @{ a = 1 }
+                pointcutData = @(
+                    @{ methodRegex = 'GET';  uriTemplateRegex = '/a/.*' }
+                    @{ methodRegex = 'POST'; uriTemplateRegex = '/b/.*' }
+                )
+            }
+            Add-ApimPolicy -EnvName 'Test' -InstanceId '777' -Policy $pol
+            Should -Invoke Invoke-AnypointCli -ParameterFilter {
+                $j = [array]::IndexOf([object[]]$ArgumentList, '--pointcut')
+                ($j -ge 0) -and
+                ($ArgumentList[$j + 1] -eq '[{"methodRegex":"GET","uriTemplateRegex":"/a/.*"},{"methodRegex":"POST","uriTemplateRegex":"/b/.*"}]')
+            }
+        }
+    }
+
+    It 'converges when desired and live carry the same multi-entry pointcut' {
+        $desired = ConvertTo-ApimNormalizedPolicy -Kind Desired -Raw @{
+            assetId = 'jwt-validation'; groupId = $g; version = '1.4.0'
+            configurationData = @{ jwksUrl = 'https://idp/keys' }
+            pointcutData = @(
+                @{ methodRegex = 'GET';  uriTemplateRegex = '/a/.*' }
+                @{ methodRegex = 'POST'; uriTemplateRegex = '/b/.*' }
+            )
+        }
+        $live = ConvertTo-ApimNormalizedPolicy -Kind Live -Raw ([pscustomobject]@{
+            policyId = 9; template = [pscustomobject]@{ groupId = $g; assetId = 'jwt-validation'; assetVersion = '1.4.0' }
+            configuration = [pscustomobject]@{ jwksUrl = 'https://idp/keys' }
+            pointcutData = @(
+                [pscustomobject]@{ methodRegex = 'GET';  uriTemplateRegex = '/a/.*' }
+                [pscustomobject]@{ methodRegex = 'POST'; uriTemplateRegex = '/b/.*' }
+            )
+        })
+        (Get-ApimPolicyPlan -Desired @($desired) -Live @($live) -Prune $true).IsEmpty | Should -BeTrue
+    }
+
+    It 'flags a change when a pointcut entry differs' {
+        $desired = ConvertTo-ApimNormalizedPolicy -Kind Desired -Raw @{
+            assetId = 'jwt-validation'; groupId = $g; version = '1.4.0'
+            configurationData = @{ jwksUrl = 'https://idp/keys' }
+            pointcutData = @(
+                @{ methodRegex = 'GET';    uriTemplateRegex = '/a/.*' }
+                @{ methodRegex = 'DELETE'; uriTemplateRegex = '/b/.*' }
+            )
+        }
+        $live = ConvertTo-ApimNormalizedPolicy -Kind Live -Raw ([pscustomobject]@{
+            policyId = 9; template = [pscustomobject]@{ groupId = $g; assetId = 'jwt-validation'; assetVersion = '1.4.0' }
+            configuration = [pscustomobject]@{ jwksUrl = 'https://idp/keys' }
+            pointcutData = @(
+                [pscustomobject]@{ methodRegex = 'GET';  uriTemplateRegex = '/a/.*' }
+                [pscustomobject]@{ methodRegex = 'POST'; uriTemplateRegex = '/b/.*' }
+            )
+        })
+        $plan = Get-ApimPolicyPlan -Desired @($desired) -Live @($live) -Prune $true
+        $plan.Edit.Count      | Should -Be 1
+        $plan.Edit[0].Changes | Should -Contain 'pointcut'
     }
 }
 
@@ -667,5 +771,98 @@ policies:
         $out.policies[0].configurationData.rateLimits[0].maximumRequests | Should -Be 300
         # masked secret restored from the prior file content
         $out.policies[1].configurationData.clientSecret | Should -Be 'super-secret'
+    }
+
+    It 'reads the REST policy shape: configuration -> configurationData, identity from template, pointcut list' {
+        $g = '68ef9520-24e9-4cf2-b2f5-620025690913'
+        $p = Join-Path $TestDrive 'rest-shape.yaml'
+        "apiInstance: {assetId: x, assetVersion: '1', instanceLabel: x-dev}`npolicies: []" | Set-Content -LiteralPath $p
+        $cfg = Read-ApimConfig -Path $p
+
+        Mock -ModuleName ApimSync Get-ApimInstanceId { '21075040' }
+        Mock -ModuleName ApimSync Get-ApimAppliedPolicy {
+            @(
+                [pscustomobject]@{
+                    policyTemplateId = '433839'; order = 1; type = 'system'; policyId = 9181953
+                    version = 1788921148318                     # revision number, must NOT become the version
+                    pointcutData = @([pscustomobject]@{ methodRegex = 'GET'; uriTemplateRegex = '/enrol/.*' })
+                    configuration = [pscustomobject]@{ clusterizable = $true; rateLimits = @([pscustomobject]@{ maximumRequests = 100 }) }
+                    template = [pscustomobject]@{ groupId = $g; assetId = 'rate-limiting'; assetVersion = '1.4.1' }
+                }
+            )
+        }
+
+        $r = Export-ApimConfig -Config $cfg -Environment dev
+        $r.Changed | Should -BeTrue
+
+        $out = ConvertFrom-Yaml (Get-Content -Raw -LiteralPath $p)
+        $out.policies[0].assetId  | Should -Be 'rate-limiting'      # from template, not '433839'
+        $out.policies[0].version  | Should -Be '1.4.1'              # from template, not the revision
+        $out.policies[0].configurationData.rateLimits[0].maximumRequests | Should -Be 100   # 'configuration' written as 'configurationData'
+        @($out.policies[0].pointcutData).Count | Should -Be 1
+        $out.policies[0].pointcutData[0].methodRegex | Should -Be 'GET'
+    }
+
+    It 'jwt-validation extract: carries textKey from the existing file, injects a placeholder when absent' {
+        $g = '68ef9520-24e9-4cf2-b2f5-620025690913'
+        $p = Join-Path $TestDrive 'jwt.yaml'
+        @"
+apiInstance: {assetId: x, assetVersion: '1', instanceLabel: x-dev}
+policies:
+  - assetId: jwt-validation
+    groupId: $g
+    version: '1.4.0'
+    configurationData:
+      jwksUrl: https://idp/keys
+      textKey: my-real-signing-key
+"@ | Set-Content -LiteralPath $p
+        $cfg = Read-ApimConfig -Path $p
+
+        Mock -ModuleName ApimSync Get-ApimInstanceId { '99' }
+        Mock -ModuleName ApimSync Get-ApimAppliedPolicy {
+            @(
+                [pscustomobject]@{ policyId = 1; order = 1; pointcutData = $null
+                    template = [pscustomobject]@{ groupId = $g; assetId = 'jwt-validation'; assetVersion = '1.4.0' }
+                    configuration = [pscustomobject]@{ jwksUrl = 'https://idp/keys'; signingMethod = 'rsa' } },   # no textKey
+                [pscustomobject]@{ policyId = 2; order = 2; pointcutData = $null
+                    template = [pscustomobject]@{ groupId = $g; assetId = 'jwt-validation-2'; assetVersion = '1.4.0' }
+                    configuration = [pscustomobject]@{ jwksUrl = 'https://idp/keys2' } }                          # new policy, no prior
+            )
+        }
+
+        # register the apply-only key for jwt-validation-2 too, for this test
+        InModuleScope ApimSync { $script:PolicyConfigDiffIgnore["68ef9520-24e9-4cf2-b2f5-620025690913:jwt-validation-2"] = @('textKey') }
+        try {
+            $r = Export-ApimConfig -Config $cfg -Environment dev
+            $out = ConvertFrom-Yaml (Get-Content -Raw -LiteralPath $p)
+            $byId = @{}; foreach ($pol in $out.policies) { $byId[$pol.assetId] = $pol }
+            $byId['jwt-validation'].configurationData.textKey   | Should -Be 'my-real-signing-key'   # carried from file
+            $byId['jwt-validation-2'].configurationData.textKey | Should -Be 'CHANGE_ME'             # injected placeholder
+            ($r.Warnings -join ' ') | Should -Match "textKey.*placeholder"
+        }
+        finally {
+            InModuleScope ApimSync { $script:PolicyConfigDiffIgnore.Remove("68ef9520-24e9-4cf2-b2f5-620025690913:jwt-validation-2") }
+        }
+    }
+
+    It 'drops read-artifact keys (assetId / assetVersion) from the written configurationData' {
+        $g = '68ef9520-24e9-4cf2-b2f5-620025690913'
+        $p = Join-Path $TestDrive 'artifacts.yaml'
+        "apiInstance: {assetId: x, assetVersion: '1', instanceLabel: x-dev}`npolicies: []" | Set-Content -LiteralPath $p
+        $cfg = Read-ApimConfig -Path $p
+
+        Mock -ModuleName ApimSync Get-ApimInstanceId { '1' }
+        Mock -ModuleName ApimSync Get-ApimAppliedPolicy {
+            @([pscustomobject]@{ policyId = 1; order = 1; pointcutData = $null
+                template = [pscustomobject]@{ groupId = $g; assetId = 'client-id-enforcement'; assetVersion = '1.3.3' }
+                # CLI-fallback style: identity leaked into the config blob
+                configuration = [pscustomobject]@{ assetId = 'client-id-enforcement'; assetVersion = '1.3.3'; credentialsOrigin = 'customExpression' } })
+        }
+
+        Export-ApimConfig -Config $cfg -Environment dev | Out-Null
+        $out = ConvertFrom-Yaml (Get-Content -Raw -LiteralPath $p)
+        $out.policies[0].configurationData.PSObject.Properties.Name | Should -Not -Contain 'assetId'
+        $out.policies[0].configurationData.PSObject.Properties.Name | Should -Not -Contain 'assetVersion'
+        $out.policies[0].configurationData.credentialsOrigin | Should -Be 'customExpression'
     }
 }
