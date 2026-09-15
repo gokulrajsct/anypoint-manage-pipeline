@@ -42,6 +42,9 @@ jobs:
           npm install -g anypoint-cli-v4
           anypoint-cli-v4 plugins:install anypoint-cli-api-mgr-plugin
           pwsh -NoProfile -Command "Install-Module powershell-yaml -Scope CurrentUser -Force -AllowClobber"
+          echo "--- versions (unpinned install - record for troubleshooting) ---"
+          anypoint-cli-v4 --version
+          anypoint-cli-v4 plugins
         displayName: Install Anypoint CLI + powershell-yaml
 
       - pwsh: |

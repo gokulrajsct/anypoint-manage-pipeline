@@ -5,9 +5,9 @@
 
 .EXAMPLE
   ./local/run-local.ps1 -Action login-check
-  ./local/run-local.ps1 -Env dev  -Api orders-api                 # dry-run reconcile
+  ./local/run-local.ps1 -Action validate                          # -Api all is fine here (read-only)
+  ./local/run-local.ps1 -Env dev  -Api orders-api                 # dry-run reconcile - one api, required
   ./local/run-local.ps1 -Env dev  -Api orders-api -Apply          # apply
-  ./local/run-local.ps1 -Env test -Apply
   ./local/run-local.ps1 -Env dev  -Api orders-api -Action extract # live -> config file
 #>
 [CmdletBinding()]
@@ -37,10 +37,10 @@ if (Test-Path $envFile) {
 
 $common = @{ Action = $Action }
 if ($Action -ne 'login-check') {
-  $common.ConfigDir = Join-Path $ConfigRoot $Env
+  $common.ConfigDir = $ConfigRoot          # repo root: <api>/apimanager/<env>.yaml|json
   $common.Api = $Api
 }
-if ($Action -in @('reconcile', 'extract')) { $common.Environment = $Env }
+if ($Action -in @('reconcile', 'extract', 'validate')) { $common.Environment = $Env }
 
 switch ($Action) {
   'reconcile' {

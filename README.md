@@ -11,9 +11,15 @@ state is one YAML file per API per environment, kept in a **separate config repo
 
 ## What it does
 
-**One pipeline, no per-API code.** Every `*.yaml` under `config/<env>/` in the config
-repo is an API ("project"). The pipeline enumerates them (`-Api all`) and reconciles each.
-Onboard a new API by adding its config files — no pipeline change.
+**One pipeline, no per-API code.** Every `<api>/apimanager/` folder in the config repo is
+an API ("project"), and the `<env>.yaml`/`.json` files inside it are that API's desired
+state per environment. Onboard a new API by adding its folder — no pipeline change.
+
+**One API per run.** `apiKey` names exactly one folder; deploying or extracting `all` at
+once is rejected on purpose (`-Api all` is only accepted by the read-only `validate`
+action, which checks every API's config offline). The folder name is just how the config
+repo organizes files — it doesn't have to match the API's name in API Manager, which comes
+from `apiInstance.assetId` inside the file.
 
 `action: deploy` promotes through environment **stages**: `Test → UAT → PreProd → Prod`.
 `PreProd` and `Prod` are gated by **approvals** (ADO Environment checks). The
@@ -27,7 +33,7 @@ Per environment + API:
 | Instance exists, config != live | apply only the differing policies (add / edit / remove / enable-disable) |
 | Instance missing, initial env (`test`) | `anypoint-cli-v4 api-mgr api manage …` (create from scratch), then apply all policies |
 | Instance missing, higher env (`uat`/`preprod`/`prod`) | `anypoint-cli-v4 api-mgr api promote …` from the previous env, then reconcile policies on top |
-| `action: extract` (initial env only) | read live `test` policies → write them into `config/test/<api>.yaml` → commit to the config repo's default branch |
+| `action: extract` (initial env only) | read live `test` policies → write them into `<api>/apimanager/test.yaml` → commit to the config repo's default branch |
 
 Policy reconcile is **declarative**: the config file is the source of truth. A policy
 applied on the API but absent from the file is **pruned** (per-API `prune: true`, default).
@@ -42,19 +48,28 @@ fix them in the API Manager UI or via the REST API.
 ## Config repo layout
 
 ```
-anypoint-policy-config/                # separate git repo
-  config/
-    test/     orders-api.yaml  payments-api.yaml  ...
-    uat/      orders-api.yaml  payments-api.yaml  ...
-    preprod/  orders-api.yaml  ...
-    prod/     orders-api.yaml  ...
+mule-config/                            # separate git repo (-ConfigDir points here)
+  orders-api/
+    apimanager/
+      test.json
+      uat.yaml
+      preprod.yaml
+      prod.yaml
+  payments-api/
+    apimanager/
+      test.yaml
+      ...
 ```
 
-One file = one API instance in one environment. **The file name (stem) is the API key.**
-The pipeline discovers the API list by globbing `config/<env>/*.yaml` — that is the only
-inventory of "projects". Editor schema:
+One folder per API; **the folder name is the API key.** Inside it, one file per
+environment under `apimanager/` — **the file stem is the logical environment name**
+(`test` / `uat` / `preprod` / `prod`), matching `APIM_ENV_MAP`'s keys. YAML and JSON can be
+mixed freely across files. The pipeline discovers the API list by globbing
+`<ConfigDir>/*/apimanager/` — that is the only inventory of "projects"; `-Environment`
+picks the one file per API that matters for a given run, and is omitted only for
+`validate`, which checks every environment file it finds. Editor schema:
 [`schema/api-config.schema.json`](schema/api-config.schema.json). Annotated example:
-[`config/test/orders-api.yaml`](config/test/orders-api.yaml).
+[`config/orders-api/apimanager/test.yaml`](config/orders-api/apimanager/test.yaml).
 
 ```yaml
 apiInstance:
@@ -86,8 +101,9 @@ policies:
       rateLimits: [{ maximumRequests: 200, timePeriodInMilliseconds: 60000 }]
 ```
 
-**Config files** may be YAML (`.yaml` / `.yml`) or JSON (`.json`) — one file per API per
-environment, the file stem is the API key. Don't define the same stem twice in a dir.
+**Config files** may be YAML (`.yaml` / `.yml`) or JSON (`.json`) — one file per environment
+under each API's `apimanager/` folder. Don't define the same environment twice there (e.g.
+both `test.yaml` and `test.json`) — that's ambiguous and the tool refuses to guess.
 
 **Live policy read:** the engine reads applied policies from the **Anypoint Platform REST
 API** (`GET …/apimanager/api/v1/organizations/{org}/environments/{env}/apis/{id}/policies`),
@@ -140,10 +156,33 @@ module, then runs `Invoke-ApimSync.ps1`.
 |---|---|---|
 | `action` | `deploy` | `deploy` = run the Test→UAT→PreProd→Prod stages; `extract` = pull live policies from the initial env and commit them |
 | `targetEnvironment` | `test` | how far a `deploy` run promotes (`test` / `uat` / `preprod` / `prod`) — later stages are skipped by `condition` |
-| `apiKey` | `all` | one config stem (`orders-api`) or `all` APIs in the config repo |
+| `apiKey` | `SELECT_ONE` | **dropdown** — pick exactly one API folder (e.g. `orders-api`). No "all": every run deploys/extracts exactly one API. Leaving it on `SELECT_ONE` fails fast with a clear error |
 | `dryRun` | `true` | `true` = plan only, no changes. For `extract`, `true` = write + commit locally but do **not** push |
 | `createMode` | `auto` | `auto` (scratch in the initial env, promote elsewhere) / `scratch` / `promote` |
 | `prune` | `fromconfig` | override the per-API `prune` flag |
+
+**Keeping the `apiKey` dropdown in sync:** Azure DevOps can't populate a YAML parameter's
+`values:` dynamically at queue time, so the list is static, generated from the config
+repo's actual `<api>/apimanager/` folders. After adding or removing an API folder there,
+regenerate it:
+
+```powershell
+./pipelines/Update-ApiKeyList.ps1 -ConfigRepoDir <path to a local clone of the config repo>
+```
+
+then commit the updated `azure-pipelines.yml`. It only rewrites the block between the
+`APIKEY_VALUES_START`/`APIKEY_VALUES_END` markers — everything else in the file, including
+the `SELECT_ONE` placeholder, is left alone.
+
+**On any step failure, the run stops — with detail.** Each policy Add/Edit/Remove/Toggle
+and each instance create/promote is wrapped so a failure names the exact policy/operation
+and instance before re-throwing (`ADD failed for rate-limiting@1.4.1 on instance 21075040: …`).
+`Invoke-ApimSync.ps1`'s top-level catch then prints the exception type, source line, and
+full call stack, raises an Azure DevOps error annotation (`##vso[task.logissue]` — shows up
+in the run summary and **Issues** tab, not just buried in the log), and exits non-zero.
+Azure DevOps's default `condition: succeeded()` on every step and stage means nothing after
+the failure point runs — no partial apply, no promotion into a later environment on a
+broken run.
 
 `APIM_INITIAL_ENV` is set to `test` by the pipeline (`variables.initialEnv`); change it in
 one place if your first environment is named differently. Each stage publishes
@@ -159,13 +198,13 @@ anypoint-cli-v4 plugins:install anypoint-cli-api-mgr-plugin
 Install-Module powershell-yaml -Scope CurrentUser -Force
 Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser -Force -SkipPublisherCheck
 
-Invoke-Pester ./tests          # 23 tests, no network (Anypoint CLI mocked)
+Invoke-Pester ./tests          # 62 tests, no network (Anypoint CLI / REST mocked)
 ```
 
-Offline config check:
+Offline config check (every environment file for every API under `./config`):
 
 ```powershell
-./Invoke-ApimSync.ps1 -Action validate -ConfigDir ./config/test
+./Invoke-ApimSync.ps1 -Action validate -ConfigDir ./config
 ```
 
 Against a real sandbox — copy `local/.env.example` to `local/.env`, fill it, then:

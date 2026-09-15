@@ -3,18 +3,28 @@
   Declarative Anypoint API Manager deployment driver (Anypoint CLI v4).
 
 .DESCRIPTION
-  reconcile    Make an environment match config/<env>/<api>.yaml. Creates the API
-               instance from scratch (initial env) or by PROMOTING from the previous
-               env, then applies only the policy differences. Empty diff => no changes.
+  Config repo layout: -ConfigDir points at the repo root, which holds one folder per
+  API; each has an apimanager/ subfolder with one file per environment
+  (<ConfigDir>/<api>/apimanager/<env>.yaml|json, e.g. orders-api/apimanager/test.json).
+
+  reconcile    Make an environment match <api>/apimanager/<env>.yaml for exactly ONE api
+               (-Api must name its folder; "all" is rejected - one run deploys one api).
+               Creates the API instance from scratch (initial env) or by PROMOTING from
+               the previous env, then applies only the policy differences. Empty diff =>
+               no changes.
   extract      Read the policies applied on the instance and write them back into the
-               config files. Allowed only for the initial environment.
-  validate     Offline schema/shape check of the config files.
+               config file, for exactly ONE api (same -Api rule as reconcile). Allowed
+               only for the initial environment.
+  validate     Offline schema/shape check of the config files. -Api all (the default) is
+               fine here - it's read-only. Checks every environment file unless
+               -Environment narrows it to one.
   login-check  Verify the connected-app credentials and list environments.
 
 .EXAMPLE
-  ./Invoke-ApimSync.ps1 -Action reconcile -Environment dev -ConfigDir ./config/dev -DryRun
-  ./Invoke-ApimSync.ps1 -Action reconcile -Environment test -ConfigDir ./config/test
-  ./Invoke-ApimSync.ps1 -Action extract   -Environment dev -ConfigDir ./config/dev -Commit -Push
+  ./Invoke-ApimSync.ps1 -Action validate  -ConfigDir ./config
+  ./Invoke-ApimSync.ps1 -Action reconcile -Environment test -ConfigDir ./config -Api orders-api -DryRun
+  ./Invoke-ApimSync.ps1 -Action reconcile -Environment test -ConfigDir ./config -Api orders-api
+  ./Invoke-ApimSync.ps1 -Action extract   -Environment test -ConfigDir ./config -Api orders-api -Commit -Push
 #>
 [CmdletBinding()]
 param(
@@ -45,6 +55,29 @@ function Require-Param([string]$Name, $Value) {
     if (-not $Value) { throw "-$Name is required for -Action $Action" }
 }
 
+function Require-SingleApi([string]$Value) {
+    # One API per run, by design: -Api all (or unset) is only meaningful for the read-only
+    # 'validate' action, never for something that changes an API instance. SELECT_ONE is the
+    # pipeline dropdown's inert placeholder (azure-pipelines.yml) - reject it by name so a run
+    # queued without changing it gets "you didn't pick one", not a generic "not found".
+    if (-not $Value -or $Value -eq 'all') {
+        throw "-Api must name exactly one API folder for -Action $Action (deploying/extracting 'all' at once is not supported)"
+    }
+    if ($Value -eq 'SELECT_ONE') {
+        throw "-Api is still 'SELECT_ONE' - pick a real API folder from the apiKey dropdown before queuing -Action $Action"
+    }
+}
+
+# Troubleshooting banner - parameters plus the non-secret env context every issue in this
+# tool has turned out to hinge on (control plane, org, env map, which policy-read path).
+Write-Host "=== apim-sync ==="
+Write-Host "action=$Action environment=$Environment configDir=$ConfigDir api=$Api dryRun=$([bool]$DryRun) createMode=$CreateMode prune=$Prune"
+Write-Host "host=$(try { Get-ApimBaseUri } catch { "n/a ($($_.Exception.Message))" }) org=$($env:ANYPOINT_ORG) policyRead=$(if ($env:APIM_POLICY_READ) { $env:APIM_POLICY_READ } else { 'rest (default)' }) initialEnv=$(Get-ApimInitialEnv)"
+Write-Host "envMap=$(if ($env:APIM_ENV_MAP) { $env:APIM_ENV_MAP } else { '(none - logical env names used as-is)' })"
+Write-Host "clientId set=$([bool]$env:ANYPOINT_CLIENT_ID) clientSecret set=$([bool]$env:ANYPOINT_CLIENT_SECRET)"
+Write-Host "PSVersion=$($PSVersionTable.PSVersion) OS=$($PSVersionTable.OS)"
+Write-Host "=================="
+
 try {
     switch ($Action) {
 
@@ -57,7 +90,7 @@ try {
 
         'validate' {
             Require-Param 'ConfigDir' $ConfigDir
-            $configs = @(Get-ApimConfigList -ConfigDir $ConfigDir -Api $Api)
+            $configs = @(Get-ApimConfigList -ConfigDir $ConfigDir -Api $Api -Environment $Environment)
             foreach ($c in $configs) {
                 Write-Host "OK  $($c.Path)  ($(@($c.Policies).Count) policies, prune=$($c.Prune))"
             }
@@ -68,7 +101,8 @@ try {
         'reconcile' {
             Require-Param 'Environment' $Environment
             Require-Param 'ConfigDir' $ConfigDir
-            $configs = @(Get-ApimConfigList -ConfigDir $ConfigDir -Api $Api)
+            Require-SingleApi $Api
+            $configs = @(Get-ApimConfigList -ConfigDir $ConfigDir -Api $Api -Environment $Environment)
             $results = @()
             foreach ($c in $configs) {
                 $results += Invoke-ApimReconcile -Config $c -Environment $Environment `
@@ -103,12 +137,13 @@ try {
         'extract' {
             Require-Param 'Environment' $Environment
             Require-Param 'ConfigDir' $ConfigDir
+            Require-SingleApi $Api
             $initial = Get-ApimInitialEnv
             if ($Environment -ne $initial -and -not $Force) {
                 Write-Error "Refusing to extract from '$Environment': only the initial environment ('$initial') is allowed. Use -Force to override."
                 exit 4
             }
-            $configs = @(Get-ApimConfigList -ConfigDir $ConfigDir -Api $Api)
+            $configs = @(Get-ApimConfigList -ConfigDir $ConfigDir -Api $Api -Environment $Environment)
             $changedPaths = @(); $keys = @(); $warn = 0
             foreach ($c in $configs) {
                 $r = Export-ApimConfig -Config $c -Environment $Environment
@@ -131,6 +166,16 @@ try {
     }
 }
 catch {
+    $summary = "apim-sync ($Action, env=$Environment, api=$Api): $($_.Exception.GetType().FullName): $($_.Exception.Message)"
+    Write-Host "[error] $summary"
+    if ($_.InvocationInfo -and $_.InvocationInfo.PositionMessage) {
+        Write-Host "[error] at: $($_.InvocationInfo.PositionMessage.Trim())"
+    }
+    if ($_.ScriptStackTrace) { Write-Host "[error] call stack:`n$($_.ScriptStackTrace)" }
+    # Surface it as a pipeline-level issue (red annotation in the ADO run summary / Issues
+    # tab), not just a line buried in the log. Harmless no-op outside Azure DevOps.
+    $escaped = $summary -replace '%', '%25' -replace ';', '%3B' -replace "`r", '%0D' -replace "`n", '%0A'
+    Write-Host "##vso[task.logissue type=error]$escaped"
     Write-Error $_
     exit 4
 }

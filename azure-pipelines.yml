@@ -1,8 +1,24 @@
-# Anypoint API Manager - declarative instance + policy deployment.
+﻿# Anypoint API Manager - declarative instance + policy deployment.
 #
-# ONE pipeline, config-driven. There is no per-API code: every *.yaml under
-# config/<env>/ in the config repo is an API ("project") that gets reconciled.
-# Add a file -> it deploys on the next run. No pipeline edits to onboard an API.
+# ONE pipeline, config-driven. There is no per-API code: every <api>/apimanager/
+# folder in the config repo is a project, and <env>.yaml|json inside it is that
+# project's desired state for one environment. Add a folder -> it's deployable on
+# the next run. No pipeline edits to onboard an API.
+#
+# `apiKey` names exactly ONE api folder per run - deploying/extracting "all" at
+# once is not supported, by design. It's a dropdown (`values:` below) so you pick a
+# real folder instead of typing one; the default is the inert placeholder
+# SELECT_ONE, so a run queued without changing it fails fast with a clear error
+# rather than silently deploying whatever happened to be first in the list.
+# Azure DevOps YAML parameters can't be populated dynamically at queue time, so
+# this list is static - regenerate it with pipelines/Update-ApiKeyList.ps1
+# whenever an API folder is added to or removed from the config repo (it finds
+# and rewrites the marked block inside the apiKey parameter below; don't
+# hand-edit that block's entries).
+# That static list is also why the `configRepo` trigger below fires the pipeline
+# on a merge but cannot itself supply apiKey - until this pipeline adds
+# changed-folder detection, treat a merge trigger as a signal to go queue a run
+# for the affected api(s), not as a fully automatic deploy.
 #
 # action = deploy  -> promote through the environment STAGES:
 #            Test -> UAT -> PreProd -> Prod
@@ -33,9 +49,14 @@ parameters:
     values: [test, uat, preprod, prod]
 
   - name: apiKey
-    displayName: API config stem, or "all"
+    displayName: API folder name (config repo path, not the Anypoint asset name) - pick one
     type: string
-    default: all
+    default: SELECT_ONE
+    values:
+      # APIKEY_VALUES_START - regenerate with pipelines/Update-ApiKeyList.ps1, do not hand-edit
+      - SELECT_ONE
+      - orders-api
+      # APIKEY_VALUES_END
 
   - name: dryRun
     displayName: Dry run (plan only, no changes)
@@ -58,7 +79,7 @@ resources:
   repositories:
     - repository: configRepo
       type: git
-      name: MyProject/anypoint-policy-config     # <-- set to your config repo
+      name: mule-config                          # <-- your config repo (prefix "Project/" if it's in a different ADO project)
       ref: refs/heads/main
       trigger:                                    # a merge to the config repo runs this pipeline
         branches:
@@ -87,7 +108,7 @@ stages:
           prune: ${{ parameters.prune }}
           initialEnv: test
           pipelineDir: $(pipelineDir)
-          configDir: "$(Build.SourcesDirectory)/config-repo/config/test"
+          configDir: "$(configRepoDir)"
 
   - stage: UAT
     displayName: UAT
@@ -105,7 +126,7 @@ stages:
           prune: ${{ parameters.prune }}
           initialEnv: test
           pipelineDir: $(pipelineDir)
-          configDir: "$(Build.SourcesDirectory)/config-repo/config/uat"
+          configDir: "$(configRepoDir)"
 
   # PreProd + Prod: add an "Approvals" check on ADO Environments
   #   anypoint-preprod and anypoint-prod (Pipelines > Environments > ... > Approvals
@@ -126,7 +147,7 @@ stages:
           prune: ${{ parameters.prune }}
           initialEnv: test
           pipelineDir: $(pipelineDir)
-          configDir: "$(Build.SourcesDirectory)/config-repo/config/preprod"
+          configDir: "$(configRepoDir)"
 
   - stage: Prod
     displayName: Prod (approval)
@@ -144,7 +165,7 @@ stages:
           prune: ${{ parameters.prune }}
           initialEnv: test
           pipelineDir: $(pipelineDir)
-          configDir: "$(Build.SourcesDirectory)/config-repo/config/prod"
+          configDir: "$(configRepoDir)"
 
   # ---- extract: live policies -> config repo (initial env only) ------------
   - stage: Extract
@@ -158,4 +179,4 @@ stages:
           initialEnv: test
           pipelineDir: $(pipelineDir)
           configRepoDir: $(configRepoDir)
-          configDir: "$(Build.SourcesDirectory)/config-repo/config/test"
+          configDir: "$(configRepoDir)"

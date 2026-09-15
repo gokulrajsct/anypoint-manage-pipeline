@@ -9,7 +9,7 @@ BeforeAll {
 Describe 'Read-ApimConfig' {
 
     It 'loads the sample test config' {
-        $c = Read-ApimConfig -Path (Join-Path $RepoRoot 'config/test/orders-api.yaml')
+        $c = Read-ApimConfig -Path (Join-Path $RepoRoot 'config/orders-api/apimanager/test.yaml') -ApiKey 'orders-api'
         $c.Key                        | Should -Be 'orders-api'
         $c.ApiInstance.instanceLabel  | Should -Be 'orders-api-test'
         $c.ApiInstance.deploymentType | Should -Be 'cloudhub2'
@@ -17,15 +17,36 @@ Describe 'Read-ApimConfig' {
         $c.Policies.Count             | Should -Be 2
     }
 
-    It 'loads every file when Api = all' {
-        $list = @(Get-ApimConfigList -ConfigDir (Join-Path $RepoRoot 'config/prod') -Api all)
+    It 'loads one apis one-environment file via the api-folder repo layout' {
+        $list = @(Get-ApimConfigList -ConfigDir (Join-Path $RepoRoot 'config') -Api all -Environment 'prod')
         $list.Count             | Should -Be 1
+        $list[0].Key            | Should -Be 'orders-api'
         $list[0].Policies.Count | Should -Be 3
     }
 
-    It 'throws for an unknown api' {
-        { Get-ApimConfigList -ConfigDir (Join-Path $RepoRoot 'config/test') -Api nope } |
-            Should -Throw -ExpectedMessage '*No config file for api*'
+    It 'loads every environment file for an api when -Environment is omitted (validate-all)' {
+        $list = @(Get-ApimConfigList -ConfigDir (Join-Path $RepoRoot 'config') -Api 'orders-api')
+        $list.Count | Should -Be 4
+        ($list.Key | Select-Object -Unique) | Should -Be 'orders-api'
+    }
+
+    It 'skips an api with no file for the requested environment (not yet promoted)' {
+        $root = Join-Path $TestDrive 'partial'
+        New-Item -ItemType Directory -Path (Join-Path $root 'a/apimanager') -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $root 'b/apimanager') -Force | Out-Null
+        '{"apiInstance":{"assetId":"a","assetVersion":"1","instanceLabel":"a-test"},"policies":[]}' |
+            Set-Content -LiteralPath (Join-Path $root 'a/apimanager/test.json')
+        '{"apiInstance":{"assetId":"b","assetVersion":"1","instanceLabel":"b-prod"},"policies":[]}' |
+            Set-Content -LiteralPath (Join-Path $root 'b/apimanager/prod.json')
+
+        $list = @(Get-ApimConfigList -ConfigDir $root -Api all -Environment 'test')
+        $list.Count  | Should -Be 1
+        $list[0].Key | Should -Be 'a'
+    }
+
+    It 'throws for an unknown api folder' {
+        { Get-ApimConfigList -ConfigDir (Join-Path $RepoRoot 'config') -Api nope -Environment 'test' } |
+            Should -Throw -ExpectedMessage '*No api folder*'
     }
 
     It 'loads a JSON config file' {
@@ -47,13 +68,14 @@ Describe 'Read-ApimConfig' {
         $c.Policies[0].order         | Should -Be 1
     }
 
-    It 'refuses when the same api is defined in two files' {
-        $d = Join-Path $TestDrive 'dupes'
-        New-Item -ItemType Directory -Path $d | Out-Null
-        '{}' | Set-Content -LiteralPath (Join-Path $d 'orders-api.yaml')
-        '{}' | Set-Content -LiteralPath (Join-Path $d 'orders-api.json')
-        { Get-ApimConfigList -ConfigDir $d -Api all }        | Should -Throw -ExpectedMessage '*Ambiguous config*'
-        { Get-ApimConfigList -ConfigDir $d -Api 'orders-api' } | Should -Throw -ExpectedMessage '*Multiple config files*'
+    It 'refuses when an api folder has two files for the same environment' {
+        $root = Join-Path $TestDrive 'dupes'
+        $am = Join-Path $root 'orders-api/apimanager'
+        New-Item -ItemType Directory -Path $am -Force | Out-Null
+        '{}' | Set-Content -LiteralPath (Join-Path $am 'test.yaml')
+        '{}' | Set-Content -LiteralPath (Join-Path $am 'test.json')
+        { Get-ApimConfigList -ConfigDir $root -Api all }                              | Should -Throw -ExpectedMessage '*Ambiguous config*'
+        { Get-ApimConfigList -ConfigDir $root -Api 'orders-api' -Environment 'test' } | Should -Throw -ExpectedMessage '*Ambiguous config*'
     }
 
     It 'rejects an invalid deploymentType' {
@@ -641,8 +663,8 @@ Describe 'Get-ApimPolicyPlan' {
 Describe 'Invoke-ApimReconcile (dry run, CLI mocked)' {
 
     BeforeAll {
-        $script:initialCfg = Read-ApimConfig -Path (Join-Path $RepoRoot 'config/test/orders-api.yaml')
-        $script:higherCfg = Read-ApimConfig -Path (Join-Path $RepoRoot 'config/uat/orders-api.yaml')
+        $script:initialCfg = Read-ApimConfig -Path (Join-Path $RepoRoot 'config/orders-api/apimanager/test.yaml') -ApiKey 'orders-api'
+        $script:higherCfg = Read-ApimConfig -Path (Join-Path $RepoRoot 'config/orders-api/apimanager/uat.yaml') -ApiKey 'orders-api'
 
         function Get-DevLivePolicies {
             @(

@@ -279,7 +279,7 @@ function Restore-ApimMaskedValue {
 # --------------------------------------------------------------------------- #
 function Read-ApimConfig {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Path)
+    param([Parameter(Mandatory)][string]$Path, [string]$ApiKey)
 
     if (-not (Test-Path -LiteralPath $Path)) { throw "Config file not found: $Path" }
     # ConvertFrom-Yaml parses JSON too (JSON is valid YAML); one code path for .yaml/.yml/.json.
@@ -322,7 +322,7 @@ function Read-ApimConfig {
 
     [pscustomobject]@{
         Path        = (Resolve-Path -LiteralPath $Path).Path
-        Key         = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+        Key         = if ($ApiKey) { $ApiKey } else { [System.IO.Path]::GetFileNameWithoutExtension($Path) }
         Raw         = $raw
         ApiInstance = $inst
         Promotion   = $promotion
@@ -332,23 +332,59 @@ function Read-ApimConfig {
 }
 
 function Get-ApimConfigList {
+    <# Config repo layout: <ConfigDir>/<api>/apimanager/<env>.(yaml|yml|json) - one folder per
+       API (the folder name is the API key), one file per environment (the file stem is the
+       logical env name, e.g. test.json / uat.yaml / prod.yaml).
+       -Environment filters to that one file per API folder; omit it to load every environment
+       file for every matched API (used by `validate`, which has no single env to check). #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$ConfigDir, [string]$Api = 'all')
+    param([Parameter(Mandatory)][string]$ConfigDir, [string]$Api = 'all', [string]$Environment)
 
     if (-not (Test-Path -LiteralPath $ConfigDir)) { throw "Config directory not found: $ConfigDir" }
-    $all = Get-ChildItem -LiteralPath $ConfigDir -File |
-        Where-Object { @('.yaml', '.yml', '.json') -contains $_.Extension } | Sort-Object Name
-
+    Write-Host "[config] scanning $ConfigDir (api='$Api', environment='$(if ($Environment) { $Environment } else { '(all)' })')"
+    $projectDirs = @(Get-ChildItem -LiteralPath $ConfigDir -Directory | Sort-Object Name)
     if ($Api -and $Api -ne 'all') {
-        $match = @($all | Where-Object { $_.BaseName -eq $Api })
-        if (-not $match) { throw "No config file for api '$Api' in $ConfigDir" }
-        if ($match.Count -gt 1) { throw "Multiple config files for api '$Api' in ${ConfigDir}: $($match.Name -join ', ')" }
-        return , (Read-ApimConfig -Path $match[0].FullName)
+        $projectDirs = @($projectDirs | Where-Object { $_.Name -eq $Api })
+        if (-not $projectDirs) {
+            $seen = @(Get-ChildItem -LiteralPath $ConfigDir -Directory | ForEach-Object { $_.Name })
+            throw "No api folder '$Api' under $ConfigDir (api folders seen: $(if ($seen) { $seen -join ', ' } else { 'none' }))"
+        }
     }
-    if (-not $all) { throw "No *.yaml / *.yml / *.json config files in $ConfigDir" }
-    $dupe = $all | Group-Object BaseName | Where-Object Count -gt 1
-    if ($dupe) { throw "Ambiguous config: $($dupe.Name -join ', ') defined in more than one file under $ConfigDir" }
-    return , @($all | ForEach-Object { Read-ApimConfig -Path $_.FullName })
+
+    $results = @()
+    foreach ($proj in $projectDirs) {
+        $amDir = Join-Path $proj.FullName 'apimanager'
+        if (-not (Test-Path -LiteralPath $amDir)) {
+            Write-Host "[config] $($proj.Name): no apimanager/ folder - skipped"
+            continue
+        }
+        $files = @(Get-ChildItem -LiteralPath $amDir -File |
+            Where-Object { @('.yaml', '.yml', '.json') -contains $_.Extension } | Sort-Object Name)
+        $dupe = $files | Group-Object BaseName | Where-Object Count -gt 1
+        if ($dupe) { throw "Ambiguous config: $($dupe.Name -join ', ') defined in more than one file under $amDir" }
+        if ($Environment) {
+            $matched = @($files | Where-Object { $_.BaseName -eq $Environment })
+            if (-not $matched) {
+                Write-Host "[config] $($proj.Name): no '$Environment' file (has: $(if ($files) { $files.BaseName -join ', ' } else { 'none' })) - skipped"
+            }
+            $files = $matched
+        }
+        foreach ($f in $files) {
+            Write-Host "[config] $($proj.Name)/$($f.Name) -> api key '$($proj.Name)'"
+            $results += Read-ApimConfig -Path $f.FullName -ApiKey $proj.Name
+        }
+    }
+
+    if (-not $results) {
+        $envPart = if ($Environment) { "'$Environment' " } else { '' }
+        if ($Api -and $Api -ne 'all') { throw "No ${envPart}config for api '$Api' under $ConfigDir" }
+        throw "No ${envPart}config files found under $ConfigDir (expected <api>/apimanager/<env>.yaml|json)"
+    }
+    Write-Host "[config] loaded $($results.Count) config file(s): $($results.Key -join ', ')"
+    # No leading comma: every call site wraps this in @(...), and a comma-protected return
+    # collapses through that wrapping - @(Get-ApimConfigList ...) would come back as a single
+    # element holding the whole array instead of one element per config.
+    return $results
 }
 
 # --------------------------------------------------------------------------- #
@@ -395,7 +431,12 @@ function Resolve-ApimEnvironmentName {
     param([Parameter(Mandatory)][string]$LogicalEnv)
     if ($env:APIM_ENV_MAP) {
         $map = $env:APIM_ENV_MAP | ConvertFrom-Json
-        if ($map.PSObject.Properties[$LogicalEnv]) { return $map.$LogicalEnv }
+        if ($map.PSObject.Properties[$LogicalEnv]) {
+            $resolved = "$($map.$LogicalEnv)"
+            Write-Host "[env] '$LogicalEnv' -> '$resolved' (APIM_ENV_MAP)"
+            return $resolved
+        }
+        Write-Host "[env] '$LogicalEnv' has no APIM_ENV_MAP entry - using it as the Anypoint environment name"
     }
     return $LogicalEnv
 }
@@ -404,9 +445,13 @@ function Get-ApimEnvironmentId {
     param([Parameter(Mandatory)][string]$EnvName)
     $data = Invoke-AnypointCli -ArgumentList @('account', 'environment', 'list', '--output', 'json') -AsJson
     foreach ($e in @($data)) {
-        if (($e.name -eq $EnvName) -or ($e.id -eq $EnvName)) { return "$($e.id)" }
+        if (($e.name -eq $EnvName) -or ($e.id -eq $EnvName)) {
+            Write-Host "[env] '$EnvName' resolved to environment id $($e.id)"
+            return "$($e.id)"
+        }
     }
-    throw "Environment '$EnvName' not found in this organization"
+    $seen = @(@($data) | ForEach-Object { $_.name })
+    throw "Environment '$EnvName' not found in this organization (environments seen: $(if ($seen) { $seen -join ', ' } else { 'none' }))"
 }
 
 function Get-ApimInstanceId {
@@ -427,8 +472,14 @@ function Get-ApimInstanceId {
 
     foreach ($i in $items) {
         $label = if ($i.PSObject.Properties['instanceLabel']) { $i.instanceLabel } else { $null }
-        if ($label -eq $InstanceLabel) { Set-ApimApiContext $i; return "$($i.id)" }
+        if ($label -eq $InstanceLabel) {
+            Write-Host "[instance] '$InstanceLabel' -> id $($i.id) in '$EnvName'"
+            Set-ApimApiContext $i
+            return "$($i.id)"
+        }
     }
+    $seen = @($items | ForEach-Object { if ($_.PSObject.Properties['instanceLabel']) { $_.instanceLabel } } | Where-Object { $_ })
+    Write-Host "[instance] '$InstanceLabel' not found in '$EnvName' (instance labels seen: $(if ($seen) { $seen -join ', ' } else { 'none' }))"
     return $null
 }
 
@@ -545,11 +596,17 @@ function Invoke-ApimRest {
 function Get-ApimOrgId {
     if ($script:ApimOrgId) { return $script:ApimOrgId }
     $org = "$($env:ANYPOINT_ORG)"
-    if ($org -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') { $script:ApimOrgId = $org; return $org }
-    foreach ($c in $script:ApimApiContext.Values) {
-        if ($c.OrgId) { $script:ApimOrgId = $c.OrgId; return $c.OrgId }
+    if ($org -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
+        Write-Host "[org] ANYPOINT_ORG is a GUID - using it directly: $org"
+        $script:ApimOrgId = $org; return $org
     }
-    throw "Cannot resolve the organization id for the REST call - set ANYPOINT_ORG to the business group id (GUID), or set APIM_POLICY_READ=cli"
+    foreach ($c in $script:ApimApiContext.Values) {
+        if ($c.OrgId) {
+            Write-Host "[org] resolved from a prior 'api list' response: $($c.OrgId)"
+            $script:ApimOrgId = $c.OrgId; return $c.OrgId
+        }
+    }
+    throw "Cannot resolve the organization id for the REST call - ANYPOINT_ORG is '$org' (not a GUID) and no prior api lookup has org context. Set ANYPOINT_ORG to the business group id (GUID), or set APIM_POLICY_READ=cli"
 }
 
 function Get-ApimAppliedPolicyViaRest {
@@ -936,13 +993,17 @@ function Invoke-ApimReconcile {
             $result.Action = 'promote'
             $result.Messages += "promote from $srcLogical/$srcLabel (instance $srcInstanceId, env $srcEnvId)"
             if (-not $DryRun) {
-                $instanceId = Invoke-ApimPromotion -TargetEnvName $envName -SourceInstanceId $srcInstanceId -SourceEnvId $srcEnvId -Config $Config
+                try { $instanceId = Invoke-ApimPromotion -TargetEnvName $envName -SourceInstanceId $srcInstanceId -SourceEnvId $srcEnvId -Config $Config }
+                catch { throw "PROMOTE failed for '$label' from '$srcLogical/$srcLabel' (source instance $srcInstanceId) into '$Environment': $($_.Exception.Message)" }
             }
         }
         else {
             $result.Action = 'create-scratch'
             $result.Messages += "create instance '$label' from $($Config.ApiInstance.assetId):$($Config.ApiInstance.assetVersion)"
-            if (-not $DryRun) { $instanceId = New-ApimInstance -EnvName $envName -Config $Config }
+            if (-not $DryRun) {
+                try { $instanceId = New-ApimInstance -EnvName $envName -Config $Config }
+                catch { throw "CREATE failed for '$label' ($($Config.ApiInstance.assetId):$($Config.ApiInstance.assetVersion)) in '$Environment': $($_.Exception.Message)" }
+            }
         }
         $result.Changed = $true
         $liveRaw = if ($DryRun -or -not $instanceId) { @() } else { Get-ApimAppliedPolicy -EnvName $envName -InstanceId $instanceId }
@@ -972,10 +1033,26 @@ function Invoke-ApimReconcile {
     }
     if ($DryRun) { $result.Messages += 'dry run: no changes applied'; return $result }
 
-    foreach ($rm in $plan.Remove) { Remove-ApimPolicy -EnvName $envName -InstanceId $instanceId -PolicyInstanceId $rm.Policy.InstanceId }
-    foreach ($ad in $plan.Add) { Add-ApimPolicy -EnvName $envName -InstanceId $instanceId -Policy $ad }
-    foreach ($ed in $plan.Edit) { Set-ApimPolicy -EnvName $envName -InstanceId $instanceId -PolicyInstanceId $ed.InstanceId -Policy $ed.Desired -Changes $ed.Changes }
-    foreach ($tg in $plan.Toggle) { Set-ApimPolicyState -EnvName $envName -InstanceId $instanceId -PolicyInstanceId $tg.InstanceId -Disabled $tg.Disabled }
+    # Each step names the exact policy + operation on failure, then stops immediately -
+    # $ErrorActionPreference = 'Stop' means the throw here propagates straight past the
+    # remaining foreach iterations, out of Invoke-ApimReconcile, to Invoke-ApimSync.ps1's
+    # catch block. No partial-apply continues past a failed operation.
+    foreach ($rm in $plan.Remove) {
+        try { Remove-ApimPolicy -EnvName $envName -InstanceId $instanceId -PolicyInstanceId $rm.Policy.InstanceId }
+        catch { throw "REMOVE failed for $($rm.Policy.AssetId)@$($rm.Policy.Version) (policy id $($rm.Policy.InstanceId)) on instance $instanceId : $($_.Exception.Message)" }
+    }
+    foreach ($ad in $plan.Add) {
+        try { Add-ApimPolicy -EnvName $envName -InstanceId $instanceId -Policy $ad }
+        catch { throw "ADD failed for $($ad.AssetId)@$($ad.Version) on instance $instanceId : $($_.Exception.Message)" }
+    }
+    foreach ($ed in $plan.Edit) {
+        try { Set-ApimPolicy -EnvName $envName -InstanceId $instanceId -PolicyInstanceId $ed.InstanceId -Policy $ed.Desired -Changes $ed.Changes }
+        catch { throw "EDIT failed for $($ed.Desired.AssetId)@$($ed.Desired.Version) (policy id $($ed.InstanceId)) on instance $instanceId : $($_.Exception.Message)" }
+    }
+    foreach ($tg in $plan.Toggle) {
+        try { Set-ApimPolicyState -EnvName $envName -InstanceId $instanceId -PolicyInstanceId $tg.InstanceId -Disabled $tg.Disabled }
+        catch { throw "TOGGLE failed for $($tg.AssetId) (policy id $($tg.InstanceId)) on instance $instanceId : $($_.Exception.Message)" }
+    }
 
     $result.Changed = $true
     if ($result.Action -eq 'none') { $result.Action = 'update' }
@@ -995,6 +1072,7 @@ function Export-ApimConfig {
     $label = "$($Config.ApiInstance.instanceLabel)"
     $instanceId = Get-ApimInstanceId -EnvName $envName -InstanceLabel $label
     if (-not $instanceId) { throw "Cannot extract '$($Config.Key)': instance '$label' not found in '$Environment'." }
+    Write-Host "[extract] $($Config.Key)/${Environment}: reading live policies for instance $instanceId"
 
     $liveRaw = Get-ApimAppliedPolicy -EnvName $envName -InstanceId $instanceId
 

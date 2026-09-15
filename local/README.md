@@ -34,4 +34,4 @@ plan to stdout and `../plan.json`. `.env` and `plan.json` are git-ignored.
 Invoke-Pester ./tests
 ```
 
-23 tests, no network — the Anypoint CLI is mocked with Pester `Mock`.
+62 tests, no network — the Anypoint CLI and REST calls are mocked with Pester `Mock`.
