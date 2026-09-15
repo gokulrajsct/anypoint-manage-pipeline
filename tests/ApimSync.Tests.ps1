@@ -888,3 +888,74 @@ policies:
         $out.policies[0].configurationData.credentialsOrigin | Should -Be 'customExpression'
     }
 }
+
+Describe 'Invoke-ApimConfigCommit' {
+    # Real git repos (a bare "remote" + a working clone) - no mocking. -Branch has no
+    # hardcoded default any more, so these prove the derive-from-checkout and
+    # detached-HEAD-error paths actually work, not just that a literal was passed through.
+
+    BeforeAll {
+        function New-TestRemoteAndClone {
+            $remote = Join-Path $TestDrive "remote-$([guid]::NewGuid().ToString('N'))"
+            $work = Join-Path $TestDrive "work-$([guid]::NewGuid().ToString('N'))"
+            git init --bare -q $remote
+            git init -q -b main $work
+            Set-Content -LiteralPath (Join-Path $work 'seed.txt') -Value 'seed'
+            git -C $work add -A
+            git -C $work -c user.name=t -c user.email=t@t.com commit -q -m seed
+            git -C $work remote add origin $remote
+            git -C $work push -q origin main
+            return $work
+        }
+    }
+
+    It 'pushes to the currently checked-out branch when -Branch is omitted' {
+        $work = New-TestRemoteAndClone
+        Set-Content -LiteralPath (Join-Path $work 'config.txt') -Value 'v1'
+        Invoke-ApimConfigCommit -RepoDir $work -Path (Join-Path $work 'config.txt') -Message 'update' -Push |
+            Should -BeTrue
+
+        $remoteUrl = "$(git -C $work remote get-url origin)"
+        $verify = Join-Path $TestDrive "verify-$([guid]::NewGuid().ToString('N'))"
+        git clone -q $remoteUrl $verify
+        git -C $verify checkout -q main
+        Get-Content (Join-Path $verify 'config.txt') | Should -Be 'v1'
+    }
+
+    It 'a -Branch override pushes there even though a different branch is checked out locally' {
+        $work = New-TestRemoteAndClone
+        git -C $work checkout -q -b local-only
+        Set-Content -LiteralPath (Join-Path $work 'config.txt') -Value 'v2'
+        Invoke-ApimConfigCommit -RepoDir $work -Path (Join-Path $work 'config.txt') -Message 'update' -Push -Branch 'other' |
+            Should -BeTrue
+
+        $remoteUrl = "$(git -C $work remote get-url origin)"
+        $verify = Join-Path $TestDrive "verify2-$([guid]::NewGuid().ToString('N'))"
+        git clone -q $remoteUrl $verify
+        git -C $verify checkout -q other
+        Get-Content (Join-Path $verify 'config.txt') | Should -Be 'v2'
+        ((git -C $verify branch -r) -join ' ') | Should -Not -Match 'local-only'
+    }
+
+    It 'throws a clear error pushing from detached HEAD with no -Branch' {
+        $work = New-TestRemoteAndClone
+        $sha = "$(git -C $work rev-parse HEAD)".Trim()
+        git -C $work checkout -q $sha
+        Set-Content -LiteralPath (Join-Path $work 'config.txt') -Value 'v3'
+        { Invoke-ApimConfigCommit -RepoDir $work -Path (Join-Path $work 'config.txt') -Message 'update' -Push } |
+            Should -Throw -ExpectedMessage '*detached HEAD*'
+    }
+
+    It 'commits locally without pushing when -Push is not set' {
+        $work = New-TestRemoteAndClone
+        Set-Content -LiteralPath (Join-Path $work 'config.txt') -Value 'v4'
+        Invoke-ApimConfigCommit -RepoDir $work -Path (Join-Path $work 'config.txt') -Message 'local only' |
+            Should -BeTrue
+        "$(git -C $work log -1 --format=%s)" | Should -Be 'local only'
+
+        $remoteUrl = "$(git -C $work remote get-url origin)"
+        $verify = Join-Path $TestDrive "verify3-$([guid]::NewGuid().ToString('N'))"
+        git clone -q $remoteUrl $verify
+        Test-Path (Join-Path $verify 'config.txt') | Should -BeFalse
+    }
+}

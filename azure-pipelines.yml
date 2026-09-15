@@ -77,13 +77,21 @@ parameters:
 
 resources:
   repositories:
+    # This is the one place a branch name is hardcoded in this pipeline - everywhere else
+    # (the Extract stage's git push, Invoke-ApimConfigCommit's default) either reads `ref`
+    # below via ${{ resources.repositories.configRepo.ref }} or derives it from whatever
+    # branch is actually checked out, instead of assuming "main". `ref` and
+    # `trigger.branches.include` below both have to name that branch: `ref` is what a
+    # manually queued run checks out, `trigger.branches.include` is what a merge has to
+    # land on to auto-trigger a run. Azure DevOps doesn't let one derive from the other -
+    # if you rename the branch, change both.
     - repository: configRepo
       type: git
       name: mule-config                          # <-- your config repo (prefix "Project/" if it's in a different ADO project)
       ref: refs/heads/main
       trigger:                                    # a merge to the config repo runs this pipeline
         branches:
-          include: [main]
+          include: [main]                         # <-- keep in sync with `ref` above
 
 variables:
   - name: pipelineDir
@@ -180,3 +188,6 @@ stages:
           pipelineDir: $(pipelineDir)
           configRepoDir: $(configRepoDir)
           configDir: "$(configRepoDir)"
+          # Single source of truth for the config repo's branch: the `ref:` declared on
+          # the configRepo resource above, not a second hardcoded literal here.
+          configBranchRef: ${{ resources.repositories.configRepo.ref }}

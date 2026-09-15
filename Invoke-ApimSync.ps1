@@ -40,7 +40,7 @@ param(
     [switch]$Commit,
     [switch]$Push,
     [string]$RepoDir,
-    [string]$Branch = 'main',
+    [string]$Branch,   # -Push without -Branch pushes back to whatever branch RepoDir has checked out
     [switch]$Force
 )
 

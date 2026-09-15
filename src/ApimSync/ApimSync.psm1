@@ -1162,7 +1162,7 @@ function Invoke-ApimConfigCommit {
         [Parameter(Mandatory)][string[]]$Path,
         [Parameter(Mandatory)][string]$Message,
         [switch]$Push,
-        [string]$Branch = 'main'
+        [string]$Branch   # omit -> push back to whatever branch $RepoDir currently has checked out
     )
     & git -C $RepoDir add -- @Path
     & git -C $RepoDir diff --cached --quiet
@@ -1175,6 +1175,13 @@ function Invoke-ApimConfigCommit {
     Write-Host "Committed: $Message"
 
     if ($Push) {
+        if (-not $Branch) {
+            $Branch = "$(& git -C $RepoDir rev-parse --abbrev-ref HEAD)".Trim()
+            if (-not $Branch -or $Branch -eq 'HEAD') {
+                throw "Cannot push: no -Branch given and $RepoDir is in detached HEAD (nothing to derive it from)"
+            }
+            Write-Host "No -Branch given; pushing to the branch currently checked out: $Branch"
+        }
         & git -C $RepoDir push origin "HEAD:refs/heads/$Branch"
         if ($LASTEXITCODE -ne 0) { throw 'git push failed' }
         Write-Host "Pushed to origin/$Branch"
