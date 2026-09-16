@@ -77,14 +77,11 @@ parameters:
 
 resources:
   repositories:
-    # This is the one place a branch name is hardcoded in this pipeline - everywhere else
-    # (the Extract stage's git push, Invoke-ApimConfigCommit's default) either reads `ref`
-    # below via ${{ resources.repositories.configRepo.ref }} or derives it from whatever
-    # branch is actually checked out, instead of assuming "main". `ref` and
-    # `trigger.branches.include` below both have to name that branch: `ref` is what a
-    # manually queued run checks out, `trigger.branches.include` is what a merge has to
-    # land on to auto-trigger a run. Azure DevOps doesn't let one derive from the other -
-    # if you rename the branch, change both.
+    # `ref` and `trigger.branches.include` below both name the config repo's branch:
+    # `ref` is what a manually queued run checks out, `trigger.branches.include` is what a
+    # merge has to land on to auto-trigger a run. They're evaluated before `variables:`
+    # exists, so they can't reference variables.configRepoBranch below - they, and it, are
+    # the three places this branch name is written; keep all three in sync if you rename it.
     - repository: configRepo
       type: git
       name: mule-config                          # <-- your config repo (prefix "Project/" if it's in a different ADO project)
@@ -98,6 +95,14 @@ variables:
     value: "$(Build.SourcesDirectory)/pipeline"
   - name: configRepoDir
     value: "$(Build.SourcesDirectory)/config-repo"
+  - name: configRepoBranch
+    value: main   # <-- keep in sync with resources.repositories.configRepo.ref/trigger above.
+                  # Passed explicitly to the Extract stage's git push, instead of an ADO
+                  # resource-predefined variable: $(resources.repositories.<alias>.ref) and
+                  # the ${{ }} compile-time form both turned out unusable for this (rejected
+                  # / not macro-substituted inside an inline script here) when tried against
+                  # a real Azure DevOps org - this plain variable is the same $(...) mechanism
+                  # already relied on for pipelineDir/configRepoDir above, so it's known-good.
   - name: initialEnv
     value: test                                   # first env in the promotion chain
 
@@ -188,6 +193,4 @@ stages:
           pipelineDir: $(pipelineDir)
           configRepoDir: $(configRepoDir)
           configDir: "$(configRepoDir)"
-          # Single source of truth for the config repo's branch: the `ref:` declared on
-          # the configRepo resource above, not a second hardcoded literal here.
-          configBranchRef: ${{ resources.repositories.configRepo.ref }}
+          configBranch: $(configRepoBranch)   # see the variables: block above

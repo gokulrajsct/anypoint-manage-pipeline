@@ -17,8 +17,8 @@ parameters:
     type: string
   - name: configDir
     type: string
-  - name: configBranchRef      # e.g. refs/heads/main - from resources.repositories.configRepo.ref
-    type: string
+  - name: configBranch         # plain branch name, e.g. main - from variables.configRepoBranch
+    type: string                # (azure-pipelines.yml), which must match resources.repositories.configRepo.ref
 
 jobs:
   - job: extract_initial
@@ -50,12 +50,7 @@ jobs:
         displayName: Install Anypoint CLI + powershell-yaml
 
       - pwsh: |
-          # Branch comes from the configRepo resource's own `ref:` (azure-pipelines.yml),
-          # not a hardcoded literal - keeps the checkout and the push target in agreement
-          # if that ref is ever changed.
-          $branch = "${{ parameters.configBranchRef }}" -replace '^refs/heads/', ''
-          if (-not $branch) { throw "configBranchRef resolved to an empty branch name" }
-          Write-Host "Extract will commit/push to branch: $branch (from ${{ parameters.configBranchRef }})"
+          Write-Host "Extract will commit/push to branch: ${{ parameters.configBranch }}"
 
           # dryRun=false -> also push the updated config to that branch
           ./Invoke-ApimSync.ps1 -Action extract `
@@ -63,7 +58,7 @@ jobs:
             -ConfigDir "${{ parameters.configDir }}" `
             -Api "${{ parameters.apiKey }}" `
             -RepoDir "${{ parameters.configRepoDir }}" `
-            -Branch $branch `
+            -Branch "${{ parameters.configBranch }}" `
             -Commit `
             -Push:$${{ eq(parameters.dryRun, false) }}
         displayName: 'Extract ${{ parameters.initialEnv }} policies (push=${{ eq(parameters.dryRun, false) }})'
