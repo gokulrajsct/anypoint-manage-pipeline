@@ -1,0 +1,26 @@
+# External tier: used by customers and/or application developers outside the
+# organisation (NZ API Standard classification). Outside the org's trust boundary, so
+# a missing security requirement is build-breaking - same strictness as public/partner.
+# See nz-api-standard.public.yaml for the note on this tiering being this project's own
+# policy, not a clause quoted from the standard.
+extends: ["./nz-api-standard.base.yaml"]
+rules:
+  nz-security-scheme-required:
+    description: "External API: every operation MUST declare a security requirement (Authorization header, NZ API Standard HTTP Headers)."
+    message: "{{path}}: operation has no security requirement declared"
+    severity: error
+    given: "$.paths[*][get,put,post,delete,patch]"
+    then:
+      field: security
+      function: truthy
+
+  nz-oauth2-scheme-required:
+    description: "NZ API Standard, Authentication and Authorisation: where a client must be authorised to use an API, agencies MUST use OAuth 2.1 (OpenID Connect is also acceptable where an OIDC provider is available). Every declared securityScheme on an external API MUST be oauth2 or openIdConnect - a bare apiKey/http scheme alone isn't enough for this tier."
+    message: "securityScheme '{{property}}' is type '{{value}}' - external APIs MUST authorise via OAuth 2.1 (oauth2) or openIdConnect"
+    severity: error
+    given: "$.components.securitySchemes[*]"
+    then:
+      field: type
+      function: enumeration
+      functionOptions:
+        values: ["oauth2", "openIdConnect"]

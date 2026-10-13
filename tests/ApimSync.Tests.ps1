@@ -66,6 +66,49 @@ Describe 'Read-ApimConfig' {
         $c.Prune                     | Should -BeFalse
         $c.Policies.Count            | Should -Be 1
         $c.Policies[0].order         | Should -Be 1
+        $c.ConfigVersion             | Should -Be '1.0.0'   # default when the file sets none
+    }
+
+    It 'reads an explicit configVersion and apiInstance.classification' {
+        $p = Join-Path $TestDrive 'classified.yaml'
+        @'
+configVersion: "2.3.1"
+apiInstance:
+  assetId: x
+  assetVersion: "1.0.0"
+  instanceLabel: x-dev
+  classification: external
+policies: []
+'@ | Set-Content -LiteralPath $p
+        $c = Read-ApimConfig -Path $p
+        $c.ConfigVersion              | Should -Be '2.3.1'
+        $c.ApiInstance.classification | Should -Be 'external'
+    }
+
+    It 'rejects an invalid classification' {
+        $p = Join-Path $TestDrive 'bad-class.yaml'
+        @'
+apiInstance:
+  assetId: x
+  assetVersion: "1.0.0"
+  instanceLabel: x-dev
+  classification: top-secret
+policies: []
+'@ | Set-Content -LiteralPath $p
+        { Read-ApimConfig -Path $p } | Should -Throw -ExpectedMessage '*classification*'
+    }
+
+    It 'rejects a malformed configVersion' {
+        $p = Join-Path $TestDrive 'bad-version.yaml'
+        @'
+configVersion: "v1"
+apiInstance:
+  assetId: x
+  assetVersion: "1.0.0"
+  instanceLabel: x-dev
+policies: []
+'@ | Set-Content -LiteralPath $p
+        { Read-ApimConfig -Path $p } | Should -Throw -ExpectedMessage '*configVersion*'
     }
 
     It 'refuses when an api folder has two files for the same environment' {
@@ -922,6 +965,26 @@ Describe 'Invoke-ApimConfigCommit' {
         Get-Content (Join-Path $verify 'config.txt') | Should -Be 'v1'
     }
 
+    It 'an explicit -Branch is never overridden by the checkout defaulting to main' {
+        # New-TestRemoteAndClone's seed/default branch IS main - this is the exact shape of
+        # the reported concern: config repo checked out on main, but the pipeline passes a
+        # different target branch (its configRepoBranch, e.g. a feature branch) explicitly.
+        $work = New-TestRemoteAndClone
+        "$(git -C $work rev-parse --abbrev-ref HEAD)" | Should -Be 'main'   # sanity: checkout is on main
+        Set-Content -LiteralPath (Join-Path $work 'config.txt') -Value 'v-feature'
+        Invoke-ApimConfigCommit -RepoDir $work -Path (Join-Path $work 'config.txt') -Message 'extract update' `
+            -Push -Branch 'feature/initial-env-branch' | Should -BeTrue
+
+        $remoteUrl = "$(git -C $work remote get-url origin)"
+        $verify = Join-Path $TestDrive "verify4-$([guid]::NewGuid().ToString('N'))"
+        git clone -q $remoteUrl $verify
+        git -C $verify checkout -q feature/initial-env-branch
+        Get-Content (Join-Path $verify 'config.txt') | Should -Be 'v-feature'
+        # main on the remote must be untouched - no fallback, no cross-contamination
+        git -C $verify checkout -q main
+        Test-Path (Join-Path $verify 'config.txt') | Should -BeFalse
+    }
+
     It 'a -Branch override pushes there even though a different branch is checked out locally' {
         $work = New-TestRemoteAndClone
         git -C $work checkout -q -b local-only
@@ -957,5 +1020,187 @@ Describe 'Invoke-ApimConfigCommit' {
         $verify = Join-Path $TestDrive "verify3-$([guid]::NewGuid().ToString('N'))"
         git clone -q $remoteUrl $verify
         Test-Path (Join-Path $verify 'config.txt') | Should -BeFalse
+    }
+}
+
+Describe 'Step-ApimConfigVersion' {
+    It 'patch-bumps a plain semver' {
+        Step-ApimConfigVersion '1.0.0' | Should -Be '1.0.1'
+        Step-ApimConfigVersion '2.4.9' | Should -Be '2.4.10'
+        Step-ApimConfigVersion '0.0.0' | Should -Be '0.0.1'
+    }
+
+    It 'rejects anything that is not plain x.y.z' {
+        { Step-ApimConfigVersion '1.0' }      | Should -Throw -ExpectedMessage '*semver*'
+        { Step-ApimConfigVersion 'v1.0.0' }   | Should -Throw -ExpectedMessage '*semver*'
+        { Step-ApimConfigVersion '1.0.0-rc1' } | Should -Throw -ExpectedMessage '*semver*'
+    }
+}
+
+Describe 'Set-ApimConfigVersion' {
+    It 'writes the new version and preserves every other section' {
+        $p = Join-Path $TestDrive 'ver.yaml'
+        @'
+configVersion: "1.0.0"
+apiInstance:
+  assetId: x
+  assetVersion: "1.0.0"
+  instanceLabel: x-dev
+promotion:
+  fromEnvironment: null
+policies: []
+'@ | Set-Content -LiteralPath $p
+        $cfg = Read-ApimConfig -Path $p -ApiKey 'x'
+
+        $r = Set-ApimConfigVersion -Config $cfg -Version '1.0.1'
+        $r.Changed | Should -BeTrue
+
+        $reread = Read-ApimConfig -Path $p -ApiKey 'x'
+        $reread.ConfigVersion                    | Should -Be '1.0.1'
+        $reread.ApiInstance.instanceLabel         | Should -Be 'x-dev'
+        $reread.Promotion.fromEnvironment         | Should -BeNullOrEmpty
+    }
+
+    It 'reports unchanged when the version is already set to that value' {
+        $p = Join-Path $TestDrive 'ver2.yaml'
+        @'
+configVersion: "1.0.1"
+apiInstance: { assetId: x, assetVersion: "1.0.0", instanceLabel: x-dev }
+policies: []
+'@ | Set-Content -LiteralPath $p
+        $cfg = Read-ApimConfig -Path $p -ApiKey 'x'
+        (Set-ApimConfigVersion -Config $cfg -Version '1.0.1').Changed | Should -BeFalse
+    }
+}
+
+Describe 'Get-ApimConfigAtVersion' {
+    BeforeAll {
+        function New-VersionedRepo {
+            # A real git repo whose config file goes through configVersion 1.0.0 -> 1.0.1 -> 1.0.2,
+            # each as its own commit - mirrors what reconcile + Set-ApimConfigVersion produce.
+            $work = Join-Path $TestDrive "verwork-$([guid]::NewGuid().ToString('N'))"
+            git init -q -b main $work
+            $am = Join-Path $work 'orders-api/apimanager'
+            New-Item -ItemType Directory -Path $am -Force | Out-Null
+            $file = Join-Path $am 'test.yaml'
+
+            foreach ($v in @('1.0.0', '1.0.1', '1.0.2')) {
+                @"
+configVersion: "$v"
+apiInstance: { assetId: orders-api, assetVersion: "1.0.0", instanceLabel: orders-api-test }
+policies:
+  - assetId: rate-limiting
+    version: "1.4.1"
+    configurationData: { maximumRequests: $($v -replace '\D','') }
+"@ | Set-Content -LiteralPath $file
+                git -C $work add -A
+                git -C $work -c user.name=t -c user.email=t@t.com commit -q -m "configVersion $v"
+            }
+            return @{ Work = $work; File = $file }
+        }
+    }
+
+    It 'finds the content of an older configVersion' {
+        $repo = New-VersionedRepo
+        $hist = Get-ApimConfigAtVersion -RepoDir $repo.Work -Path $repo.File -Version '1.0.1'
+        $hist.Content | Should -Match 'configVersion: "1\.0\.1"'
+        $hist.Commit   | Should -Not -BeNullOrEmpty
+
+        # current working copy is still at the latest version - lookup didn't touch it
+        (Get-Content -Raw -LiteralPath $repo.File) | Should -Match 'configVersion: "1\.0\.2"'
+    }
+
+    It 'throws a clear error when the version was never committed' {
+        $repo = New-VersionedRepo
+        { Get-ApimConfigAtVersion -RepoDir $repo.Work -Path $repo.File -Version '9.9.9' } |
+            Should -Throw -ExpectedMessage "*9.9.9*"
+    }
+}
+
+Describe 'reconcile -> version bump -> commit (the chain Invoke-ApimSync.ps1 -Action reconcile runs)' {
+    # Not invoking the .ps1 directly: it does Import-Module -Force internally, which would
+    # clobber any Mock set up ahead of time. This chains the same module functions the
+    # script's own Invoke-ApplyAndVersion does, with the CLI boundary mocked, against a
+    # real git repo - so it proves the version+commit wiring, not just each piece alone.
+
+    It 'bumps configVersion and commits it only when reconcile actually changed something' {
+        $remote = Join-Path $TestDrive "chain-remote-$([guid]::NewGuid().ToString('N'))"
+        $work = Join-Path $TestDrive "chain-work-$([guid]::NewGuid().ToString('N'))"
+        git init --bare -q $remote
+        git init -q -b main $work
+        $am = Join-Path $work 'orders-api/apimanager'
+        New-Item -ItemType Directory -Path $am -Force | Out-Null
+        $file = Join-Path $am 'test.yaml'
+        @'
+configVersion: "1.0.0"
+apiInstance: { assetId: orders-api, assetVersion: "1.0.0", instanceLabel: orders-api-test }
+policies:
+  - assetId: rate-limiting
+    groupId: 68ef9520-24e9-4cf2-b2f5-620025690913
+    version: "1.4.1"
+    configurationData: { maximumRequests: 200 }
+'@ | Set-Content -LiteralPath $file
+        git -C $work add -A
+        git -C $work -c user.name=t -c user.email=t@t.com commit -q -m seed
+        git -C $work remote add origin $remote
+        git -C $work push -q origin main
+
+        Mock -ModuleName ApimSync Get-ApimInstanceId { '777' }
+        $script:chainApplied = $false
+        Mock -ModuleName ApimSync Get-ApimAppliedPolicy {
+            # Before Add-ApimPolicy "runs": nothing live (forces an Add). After: report it
+            # applied, so the post-apply re-read Assert-ApimConverged does converges.
+            if ($script:chainApplied) {
+                @([pscustomobject]@{
+                    id = 1; order = 1; disabled = $false; pointcutData = $null
+                    template = [pscustomobject]@{ groupId = '68ef9520-24e9-4cf2-b2f5-620025690913'; assetId = 'rate-limiting'; version = '1.4.1' }
+                    configurationData = [pscustomobject]@{ maximumRequests = 200 }
+                })
+            }
+            else { @() }
+        }
+        Mock -ModuleName ApimSync Add-ApimPolicy { $script:chainApplied = $true }
+
+        $cfg = Read-ApimConfig -Path $file -ApiKey 'orders-api'
+        $result = Invoke-ApimReconcile -Config $cfg -Environment 'test'
+        $result.Changed | Should -BeTrue
+
+        $next = Step-ApimConfigVersion $cfg.ConfigVersion
+        $next | Should -Be '1.0.1'
+        $verResult = Set-ApimConfigVersion -Config $cfg -Version $next
+        Invoke-ApimConfigCommit -RepoDir $work -Path $verResult.Path `
+            -Message 'chore(apim): orders-api test configVersion -> 1.0.1' -Push | Should -BeTrue
+
+        (Read-ApimConfig -Path $file -ApiKey 'orders-api').ConfigVersion | Should -Be '1.0.1'
+        $verify = Join-Path $TestDrive "chain-verify-$([guid]::NewGuid().ToString('N'))"
+        git clone -q $remote $verify
+        git -C $verify checkout -q main
+        (Get-Content -Raw -LiteralPath (Join-Path $verify 'orders-api/apimanager/test.yaml')) |
+            Should -Match 'configVersion:\s*"?1\.0\.1"?'
+    }
+
+    It 'does not touch configVersion when the plan is empty' {
+        Mock -ModuleName ApimSync Get-ApimInstanceId { '777' }
+        Mock -ModuleName ApimSync Get-ApimAppliedPolicy {
+            @([pscustomobject]@{
+                id = 1; order = 1; disabled = $false; pointcutData = $null
+                template = [pscustomobject]@{ groupId = '68ef9520-24e9-4cf2-b2f5-620025690913'; assetId = 'rate-limiting'; version = '1.4.1' }
+                configurationData = [pscustomobject]@{ maximumRequests = 200 }
+            })
+        }
+
+        $p = Join-Path $TestDrive 'noop.yaml'
+        @'
+configVersion: "1.0.0"
+apiInstance: { assetId: orders-api, assetVersion: "1.0.0", instanceLabel: orders-api-test }
+policies:
+  - assetId: rate-limiting
+    groupId: 68ef9520-24e9-4cf2-b2f5-620025690913
+    version: "1.4.1"
+    configurationData: { maximumRequests: 200 }
+'@ | Set-Content -LiteralPath $p
+        $cfg = Read-ApimConfig -Path $p -ApiKey 'orders-api'
+        $result = Invoke-ApimReconcile -Config $cfg -Environment 'test'
+        $result.Changed | Should -BeFalse   # nothing to bump - the driver script skips versioning here
     }
 }

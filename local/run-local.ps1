@@ -5,17 +5,21 @@
 
 .EXAMPLE
   ./local/run-local.ps1 -Action login-check
-  ./local/run-local.ps1 -Action validate                          # -Api all is fine here (read-only)
-  ./local/run-local.ps1 -Env dev  -Api orders-api                 # dry-run reconcile - one api, required
-  ./local/run-local.ps1 -Env dev  -Api orders-api -Apply          # apply
-  ./local/run-local.ps1 -Env dev  -Api orders-api -Action extract # live -> config file
+  ./local/run-local.ps1 -Action validate                              # -Api all is fine here (read-only)
+  ./local/run-local.ps1 -Env dev  -Api orders-api -Action validate-spec   # NZ API Standard spec lint
+  ./local/run-local.ps1 -Env dev  -Api orders-api                     # dry-run reconcile - one api, required
+  ./local/run-local.ps1 -Env dev  -Api orders-api -Apply              # apply
+  ./local/run-local.ps1 -Env dev  -Api orders-api -Action extract     # live -> config file
+  ./local/run-local.ps1 -Env dev  -Api orders-api -Action redeploy -TargetVersion 1.0.3 -RepoRoot ../config-repo
 #>
 [CmdletBinding()]
 param(
   [ValidateSet('test', 'uat', 'preprod', 'prod')] [string]$Env = 'test',
-  [ValidateSet('reconcile', 'extract', 'validate', 'login-check')] [string]$Action = 'reconcile',
+  [ValidateSet('reconcile', 'extract', 'validate', 'validate-spec', 'redeploy', 'login-check')] [string]$Action = 'reconcile',
   [string]$Api = 'all',
   [string]$ConfigRoot,
+  [string]$TargetVersion,               # redeploy only
+  [string]$RepoRoot,                    # redeploy/commit: the git repo ConfigRoot lives in (defaults to ConfigRoot)
   [switch]$Apply,                       # omit => -DryRun
   [ValidateSet('fromconfig', 'true', 'false')] [string]$Prune = 'fromconfig',
   [switch]$Commit,
@@ -40,15 +44,20 @@ if ($Action -ne 'login-check') {
   $common.ConfigDir = $ConfigRoot          # repo root: <api>/apimanager/<env>.yaml|json
   $common.Api = $Api
 }
-if ($Action -in @('reconcile', 'extract', 'validate')) { $common.Environment = $Env }
+if ($Action -in @('reconcile', 'extract', 'validate', 'validate-spec', 'redeploy')) { $common.Environment = $Env }
+if (-not $RepoRoot) { $RepoRoot = $ConfigRoot }
 
 switch ($Action) {
   'reconcile' {
     & (Join-Path $repo 'Invoke-ApimSync.ps1') @common -Prune $Prune -DryRun:(-not $Apply) `
-      -PlanOut (Join-Path $repo 'plan.json')
+      -PlanOut (Join-Path $repo 'plan.json') -RepoDir $RepoRoot -Commit:$Commit -Push:$Push
   }
   'extract' {
-    & (Join-Path $repo 'Invoke-ApimSync.ps1') @common -Commit:$Commit -Push:$Push
+    & (Join-Path $repo 'Invoke-ApimSync.ps1') @common -Commit:$Commit -Push:$Push -RepoDir $RepoRoot
+  }
+  'redeploy' {
+    & (Join-Path $repo 'Invoke-ApimSync.ps1') @common -TargetVersion $TargetVersion -Prune $Prune `
+      -DryRun:(-not $Apply) -RepoDir $RepoRoot -Commit:$Commit -Push:$Push
   }
   default {
     & (Join-Path $repo 'Invoke-ApimSync.ps1') @common

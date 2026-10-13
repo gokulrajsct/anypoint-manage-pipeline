@@ -40,13 +40,18 @@ parameters:
     displayName: Action
     type: string
     default: deploy
-    values: [deploy, extract]
+    values: [deploy, extract, redeploy]
 
   - name: targetEnvironment
-    displayName: Deploy up to (deploy only)
+    displayName: Deploy up to (deploy only) / environment to redeploy into (redeploy only)
     type: string
     default: test
     values: [test, uat, preprod, prod]
+
+  - name: targetVersion
+    displayName: configVersion to redeploy (redeploy only, e.g. 1.0.3) - ignored otherwise
+    type: string
+    default: ''
 
   - name: apiKey
     displayName: API folder name (config repo path, not the Anypoint asset name) - pick one
@@ -85,10 +90,10 @@ resources:
     - repository: configRepo
       type: git
       name: mule-config                          # <-- your config repo (prefix "Project/" if it's in a different ADO project)
-      ref: refs/heads/main
+      ref: refs/heads/feature/initial-env-branch  # <-- keep in sync with `trigger` below
       trigger:                                    # a merge to the config repo runs this pipeline
         branches:
-          include: [main]                         # <-- keep in sync with `ref` above
+          include: [feature/initial-env-branch]   # <-- keep in sync with `ref` above
 
 variables:
   - name: pipelineDir
@@ -96,9 +101,9 @@ variables:
   - name: configRepoDir
     value: "$(Build.SourcesDirectory)/config-repo"
   - name: configRepoBranch
-    value: main   # <-- keep in sync with resources.repositories.configRepo.ref/trigger above.
-                  # Passed explicitly to the Extract stage's git push, instead of an ADO
-                  # resource-predefined variable: $(resources.repositories.<alias>.ref) and
+    value: feature/initial-env-branch   # <-- keep in sync with resources.repositories.configRepo.ref/trigger above.
+                                        # Passed explicitly to the Extract stage's git push, instead of an ADO
+                                        # resource-predefined variable: $(resources.repositories.<alias>.ref) and
                   # the ${{ }} compile-time form both turned out unusable for this (rejected
                   # / not macro-substituted inside an inline script here) when tried against
                   # a real Azure DevOps org - this plain variable is the same $(...) mechanism
@@ -122,6 +127,7 @@ stages:
           initialEnv: test
           pipelineDir: $(pipelineDir)
           configDir: "$(configRepoDir)"
+          configBranch: $(configRepoBranch)
 
   - stage: UAT
     displayName: UAT
@@ -140,6 +146,7 @@ stages:
           initialEnv: test
           pipelineDir: $(pipelineDir)
           configDir: "$(configRepoDir)"
+          configBranch: $(configRepoBranch)
 
   # PreProd + Prod: add an "Approvals" check on ADO Environments
   #   anypoint-preprod and anypoint-prod (Pipelines > Environments > ... > Approvals
@@ -161,6 +168,7 @@ stages:
           initialEnv: test
           pipelineDir: $(pipelineDir)
           configDir: "$(configRepoDir)"
+          configBranch: $(configRepoBranch)
 
   - stage: Prod
     displayName: Prod (approval)
@@ -179,6 +187,7 @@ stages:
           initialEnv: test
           pipelineDir: $(pipelineDir)
           configDir: "$(configRepoDir)"
+          configBranch: $(configRepoBranch)
 
   # ---- extract: live policies -> config repo (initial env only) ------------
   - stage: Extract
@@ -194,3 +203,25 @@ stages:
           configRepoDir: $(configRepoDir)
           configDir: "$(configRepoDir)"
           configBranch: $(configRepoBranch)   # see the variables: block above
+
+  # ---- redeploy: roll back one api/env to an earlier configVersion ---------
+  # Restores <api>/apimanager/<targetEnvironment>.yaml to its content at configVersion
+  # targetVersion (found via git history - see Get-ApimConfigAtVersion) and reconciles
+  # that. A successful redeploy is itself a new deployment: configVersion advances again
+  # rather than resetting, so git history stays the complete, linear record.
+  - stage: Redeploy
+    displayName: Redeploy a previous configVersion
+    condition: eq('${{ parameters.action }}', 'redeploy')
+    jobs:
+      - template: pipelines/templates/redeploy-job.yml
+        parameters:
+          environment: ${{ parameters.targetEnvironment }}
+          apiKey: ${{ parameters.apiKey }}
+          targetVersion: ${{ parameters.targetVersion }}
+          dryRun: ${{ parameters.dryRun }}
+          createMode: ${{ parameters.createMode }}
+          prune: ${{ parameters.prune }}
+          initialEnv: test
+          pipelineDir: $(pipelineDir)
+          configDir: "$(configRepoDir)"
+          configBranch: $(configRepoBranch)

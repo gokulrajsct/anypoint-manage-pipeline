@@ -13,7 +13,9 @@
         'Write-ApimPlan', 'Invoke-AnypointCli', 'Resolve-ApimEnvironmentName',
         'Get-ApimEnvironmentId', 'Get-ApimInstanceId', 'Get-ApimAppliedPolicy',
         'Get-ApimAppliedPolicyViaRest', 'Get-ApimBaseUri', 'Get-ApimAccessToken',
-        'New-ApimInstance', 'Invoke-ApimPromotion', 'Get-ApimInitialEnv'
+        'New-ApimInstance', 'Invoke-ApimPromotion', 'Get-ApimInitialEnv',
+        'Write-ApimConfigFile', 'Step-ApimConfigVersion', 'Set-ApimConfigVersion',
+        'Get-ApimConfigAtVersion', 'Get-ApimExchangeAssetSpec', 'Invoke-ApimSpecLint'
     )
     CmdletsToExport   = @()
     VariablesToExport = @()

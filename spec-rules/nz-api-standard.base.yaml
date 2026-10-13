@@ -1,0 +1,98 @@
+# Base rules for the NZ Government API Standard
+# (https://standards.digital.govt.nz/docref/api-standard/2026-09-01/en/).
+# Extended by the per-classification files in this folder, which add TWO more rules -
+# nz-security-scheme-required and nz-oauth2-scheme-required - at a severity that depends
+# on the API's audience tier.
+# Everything in this file is checked here regardless of classification. Each rule is
+# traceable to a specific normative sentence in the standard (MUST = error, SHOULD = warn):
+#   - HTTP Requirements: every response MUST declare Content-Type; requests that carry a
+#     body (PATCH/POST/PUT/DELETE) MUST declare Content-Type; endpoint URLs MUST advertise
+#     resources (nouns), not verbs.
+#   - Resource Design: resource names MUST be noun-based and in lower case.
+#   - Versioning: a URL-versioned path MUST use /vN (major version only) - agencies MUST
+#     NOT put a minor version number in the URL path.
+#   - Data Validation: APIs SHOULD use JSON as the default payload format, validated
+#     against a JSON Schema - checked here as "every declared application/json content
+#     block SHOULD carry a schema".
+#
+# Not encoded here (not machine-checkable from a spec document alone, or requires a
+# JSONPath filter this Spectral/Nimma version couldn't reliably express - see the
+# deprecated-operation Deprecation-header rule, dropped after it either matched nothing or,
+# via recursive descent, also matched unrelated `deprecated: true` schema properties):
+# TLS/cipher requirements, OAuth token lifetime/signing, API key length, deprecated-version
+# response headers, and anything else that is a runtime/operational property rather than a
+# static property of the OpenAPI document.
+#
+# This encodes the specific, machine-checkable rules verified against the published
+# standard - it is not a certified or exhaustive compliance tool. Extend it as your org's
+# interpretation of the standard grows.
+extends: ["spectral:oas"]
+rules:
+  nz-response-content-type-required:
+    description: "NZ API Standard, HTTP Requirements: every response MUST declare Content-Type."
+    message: "{{path}}: response '{{property}}' has no content/media type declared"
+    severity: error
+    given: "$.paths[*][get,put,post,delete,patch,head,options,trace].responses[*]"
+    then:
+      field: content
+      function: truthy
+
+  nz-request-content-type-required:
+    description: "NZ API Standard, HTTP Requirements: requests that include a request body (PATCH, POST, PUT, DELETE) MUST include a Content-Type header."
+    message: "{{path}}: requestBody has no content/media type declared"
+    severity: error
+    given: "$.paths[*][put,post,patch,delete].requestBody"
+    then:
+      field: content
+      function: truthy
+
+  nz-url-version-major-only:
+    description: "NZ API Standard, Versioning: a URL-versioned path MUST use /vN (major version only) - no minor version in the URL path."
+    message: "path '{{value}}' includes a minor version number in a /vN segment - agencies MUST NOT do this"
+    severity: error
+    given: "$.paths"
+    then:
+      field: "@key"
+      function: pattern
+      functionOptions:
+        notMatch: "/v\\d+\\.\\d+"
+
+  nz-resource-path-lowercase:
+    description: "NZ API Standard, Resource Design: resource names MUST be noun-based... in lower case. (Path parameters, e.g. {orderId}, are exempt - this checks the literal resource segments only.)"
+    message: "path '{{value}}' has a resource segment that isn't lower case"
+    severity: error
+    given: "$.paths"
+    then:
+      field: "@key"
+      function: pattern
+      functionOptions:
+        match: '^(/(\{[A-Za-z0-9_]+\}|[a-z0-9_-]+))+$'
+
+  nz-resource-no-verbs-in-path:
+    description: "NZ API Standard, HTTP Requirements: endpoint URLs MUST advertise resources (nouns) and avoid including verbs. Heuristic check for a common verb prefixed onto a path segment (e.g. /getOrders, /create-order); it can't catch every case and may occasionally misfire on a legitimate noun - treat a hit as a prompt to double-check the name, not an automatic rejection."
+    message: "path '{{value}}' looks like it has a verb in it - endpoint URLs MUST advertise resources (nouns), not actions"
+    severity: warn
+    given: "$.paths"
+    then:
+      field: "@key"
+      function: pattern
+      functionOptions:
+        notMatch: '/(get|create|update|delete|remove|fetch|list|set)([A-Z]|-|_|/|$)'
+
+  nz-json-schema-required-for-response:
+    description: "NZ API Standard, Data Validation: a JSON Schema SHOULD be used to define and validate data structures - every declared application/json response body SHOULD carry a schema."
+    message: "{{path}}: application/json response content has no schema"
+    severity: warn
+    given: "$.paths[*][get,put,post,delete,patch,head,options,trace].responses[*].content[application/json]"
+    then:
+      field: schema
+      function: truthy
+
+  nz-json-schema-required-for-request-body:
+    description: "NZ API Standard, Data Validation: a JSON Schema SHOULD be used to define and validate data structures - every declared application/json request body SHOULD carry a schema."
+    message: "{{path}}: application/json request body content has no schema"
+    severity: warn
+    given: "$.paths[*][put,post,patch,delete].requestBody.content[application/json]"
+    then:
+      field: schema
+      function: truthy

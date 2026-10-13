@@ -13,6 +13,10 @@ $script:DeploymentTypeMap = @{
     'cloudhub2' = 'cloudhub2'; 'cloudhub' = 'cloudhub'; 'hybrid' = 'hybrid'; 'rtf' = 'rtf'
 }
 
+# NZ Government API Standard audience categories (standards.digital.govt.nz). Picks which
+# spec-rules/*.yaml Spectral ruleset tier Invoke-ApimSpecLint applies.
+$script:ApiClassifications = @('internal', 'external', 'partner', 'public')
+
 # REST read path state (per process). ApimApiContext maps an API instance id to the
 # org/env ids seen on the `api list` / `api manage` / `api promote` response, so the
 # policies endpoint can be built without an extra lookup.
@@ -300,6 +304,16 @@ function Read-ApimConfig {
     if ($dt -and -not $script:DeploymentTypeMap.ContainsKey("$dt")) {
         throw "${Path}: invalid apiInstance.deploymentType '$dt' (allowed: cloudhub, cloudhub2, hybrid, rtf)"
     }
+    $classification = Get-DictValue $inst 'classification'
+    if ($classification -and ($script:ApiClassifications -notcontains "$classification")) {
+        throw "${Path}: invalid apiInstance.classification '$classification' (allowed: $($script:ApiClassifications -join ', '))"
+    }
+
+    $configVersion = Get-DictValue $raw 'configVersion'
+    if (-not $configVersion) { $configVersion = '1.0.0' }
+    if ("$configVersion" -notmatch '^\d+\.\d+\.\d+$') {
+        throw "${Path}: configVersion '$configVersion' must be a plain semver x.y.z"
+    }
 
     $policies = @()
     $rawPolicies = Get-DictValue $raw 'policies'
@@ -321,13 +335,14 @@ function Read-ApimConfig {
     $prune = if ($raw.Contains('prune')) { [bool]$raw['prune'] } else { $true }
 
     [pscustomobject]@{
-        Path        = (Resolve-Path -LiteralPath $Path).Path
-        Key         = if ($ApiKey) { $ApiKey } else { [System.IO.Path]::GetFileNameWithoutExtension($Path) }
-        Raw         = $raw
-        ApiInstance = $inst
-        Promotion   = $promotion
-        Prune       = $prune
-        Policies    = $policies
+        Path          = (Resolve-Path -LiteralPath $Path).Path
+        Key           = if ($ApiKey) { $ApiKey } else { [System.IO.Path]::GetFileNameWithoutExtension($Path) }
+        Raw           = $raw
+        ApiInstance   = $inst
+        Promotion     = $promotion
+        Prune         = $prune
+        Policies      = $policies
+        ConfigVersion = "$configVersion"
     }
 }
 
@@ -607,6 +622,72 @@ function Get-ApimOrgId {
         }
     }
     throw "Cannot resolve the organization id for the REST call - ANYPOINT_ORG is '$org' (not a GUID) and no prior api lookup has org context. Set ANYPOINT_ORG to the business group id (GUID), or set APIM_POLICY_READ=cli"
+}
+
+# --------------------------------------------------------------------------- #
+# NZ Government API Standard spec validation (Exchange fetch + Spectral lint)
+# --------------------------------------------------------------------------- #
+function Get-ApimExchangeAssetSpec {
+    <# Download the primary spec file (OAS/RAML/WSDL) for an Exchange asset so it can be
+       linted. Exchange asset identity (groupId/assetId/assetVersion) is the same triple
+       apiInstance already carries - this is NOT the Anypoint Platform API Manager API,
+       it's the separate Exchange REST API. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$GroupId,
+        [Parameter(Mandatory)][string]$AssetId,
+        [Parameter(Mandatory)][string]$AssetVersion,
+        [Parameter(Mandatory)][string]$OutFile
+    )
+    $uri = "$(Get-ApimBaseUri)/exchange/api/v2/assets/$GroupId/$AssetId/$AssetVersion"
+    $asset = Invoke-ApimRest -Method Get -Uri $uri -Headers @{ Authorization = "Bearer $(Get-ApimAccessToken)" }
+    $files = @($asset.files)
+    if (-not $files) { throw "Exchange asset $GroupId/$AssetId/$AssetVersion has no files to validate" }
+
+    # Prefer an API-spec classifier over other asset files (icons, examples, ...).
+    $file = $null
+    foreach ($classifier in @('fat-oas', 'oas', 'fat-raml', 'raml', 'wsdl')) {
+        $file = $files | Where-Object { "$($_.classifier)" -eq $classifier } | Select-Object -First 1
+        if ($file) { break }
+    }
+    if (-not $file) { $file = $files[0] }
+    if (-not $file.downloadURL) { throw "Exchange asset $GroupId/$AssetId/${AssetVersion}: spec file has no downloadURL" }
+
+    Write-Host "[spec] downloading '$($file.classifier)' spec for $AssetId@$AssetVersion"
+    Invoke-WebRequest -Uri "$($file.downloadURL)" -OutFile $OutFile -UseBasicParsing | Out-Null
+    return [pscustomobject]@{ Path = $OutFile; Classifier = "$($file.classifier)" }
+}
+
+function Invoke-ApimSpecLint {
+    <# Run `spectral lint` against a downloaded spec with a classification-tiered ruleset.
+       Throws (with every finding already logged) if any error-severity finding comes back;
+       otherwise returns the finding list (may include warn/info/hint entries). #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$SpecFile, [Parameter(Mandatory)][string]$RulesetFile)
+
+    $exe = if ($env:SPECTRAL_CLI) { $env:SPECTRAL_CLI } else { 'spectral' }
+    $outFile = [System.IO.Path]::GetTempFileName()
+    try {
+        Write-Host "[spec] $exe lint $SpecFile --ruleset $RulesetFile"
+        & $exe lint $SpecFile --ruleset $RulesetFile --format json --output $outFile 2>&1 |
+            ForEach-Object { Write-Host "[spec] $_" }
+        $code = $LASTEXITCODE
+        $json = if (Test-Path -LiteralPath $outFile) { "$(Get-Content -Raw -LiteralPath $outFile)".Trim() } else { '' }
+    }
+    finally { Remove-Item -LiteralPath $outFile -ErrorAction SilentlyContinue }
+
+    $results = if ($json) { @($json | ConvertFrom-Json) } else { @() }
+    $sevNames = @('ERROR', 'WARN', 'INFO', 'HINT')
+    foreach ($r in $results) {
+        $sev = if ($null -ne $r.severity -and [int]$r.severity -lt $sevNames.Count) { $sevNames[[int]$r.severity] } else { '?' }
+        $path = if ($r.path) { ($r.path -join '.') } else { '(root)' }
+        Write-Host "[spec] $sev $($r.code) at $path : $($r.message)"
+    }
+    $errors = @($results | Where-Object { [int]$_.severity -eq 0 })
+    if ($errors.Count -gt 0 -or $code -ne 0) {
+        throw "Spec lint failed against '$RulesetFile': $($errors.Count) error-severity finding(s) (see [spec] lines above)"
+    }
+    return $results
 }
 
 function Get-ApimAppliedPolicyViaRest {
@@ -1136,23 +1217,91 @@ function Export-ApimConfig {
     }
     if (-not $newRaw.Contains('policies')) { $newRaw['policies'] = $entries }
 
-    if ([System.IO.Path]::GetExtension($Config.Path) -eq '.json') {
-        $text = ($newRaw | ConvertTo-Json -Depth 40)   # JSON has no comments; emit the object only
-    }
-    else {
-        $header = "# Managed by apim-sync. 'extract' overwrites the policies list from the live $Environment instance;`n" +
-                  "# other sections are preserved. Review before merging.`n"
-        $text = $header + (ConvertTo-Yaml $newRaw)
-    }
-
-    $current = if (Test-Path -LiteralPath $Config.Path) { Get-Content -Raw -LiteralPath $Config.Path } else { '' }
-    $changed = ($current -ne $text)
-    if ($changed) { Set-Content -LiteralPath $Config.Path -Value $text -Encoding utf8 }
+    $header = "# Managed by apim-sync. 'extract' overwrites the policies list from the live $Environment instance;`n" +
+              "# other sections are preserved. Review before merging.`n"
+    $changed = Write-ApimConfigFile -Path $Config.Path -Raw $newRaw -YamlHeader $header
 
     [pscustomobject]@{
         Api = $Config.Key; Path = $Config.Path; Changed = $changed
         PolicyCount = $entries.Count; Warnings = $warnings
     }
+}
+
+function Write-ApimConfigFile {
+    <# Serialize $Raw to $Path in whatever format the path's extension implies (.json has
+       no comments; .yaml/.yml gets $YamlHeader prepended), writing only if the content
+       actually changed. Shared by extract and configVersion bumps so both stay consistent. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Raw, [string]$YamlHeader)
+
+    if ([System.IO.Path]::GetExtension($Path) -eq '.json') {
+        $text = ($Raw | ConvertTo-Json -Depth 40)
+    }
+    else {
+        $text = "$YamlHeader$(ConvertTo-Yaml $Raw)"
+    }
+    $current = if (Test-Path -LiteralPath $Path) { Get-Content -Raw -LiteralPath $Path } else { '' }
+    $changed = ($current -ne $text)
+    if ($changed) { Set-Content -LiteralPath $Path -Value $text -Encoding utf8 }
+    return $changed
+}
+
+function Step-ApimConfigVersion {
+    <# Patch-bump a plain x.y.z semver: 1.0.0 -> 1.0.1. Major/minor are left for a human
+       to bump deliberately in the config file - reconcile only ever advances patch. #>
+    param([Parameter(Mandatory)][string]$Version)
+    if ("$Version" -notmatch '^(\d+)\.(\d+)\.(\d+)$') { throw "configVersion '$Version' is not a plain semver x.y.z" }
+    return "$($Matches[1]).$($Matches[2]).$([int]$Matches[3] + 1)"
+}
+
+function Set-ApimConfigVersion {
+    <# Write a new configVersion into the config file, preserving every other section.
+       Compares against the already-parsed current version, not a re-serialized text diff -
+       Write-ApimConfigFile's own header comment would otherwise make every call look
+       "changed" even when the version value is identical. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string]$Version)
+    if ("$($Config.ConfigVersion)" -eq $Version) {
+        return [pscustomobject]@{ Path = $Config.Path; Version = $Version; Changed = $false }
+    }
+    $newRaw = [ordered]@{}
+    foreach ($k in $Config.Raw.Keys) { $newRaw["$k"] = $Config.Raw[$k] }
+    $newRaw['configVersion'] = $Version
+    $header = "# apim-sync: configVersion bumped to $Version by a successful reconcile.`n"
+    Write-ApimConfigFile -Path $Config.Path -Raw $newRaw -YamlHeader $header | Out-Null
+    [pscustomobject]@{ Path = $Config.Path; Version = $Version; Changed = $true }
+}
+
+function Get-ApimConfigAtVersion {
+    <# Walk $Path's git history (inside $RepoDir) for the commit whose configVersion equals
+       $Version, and return that historical file content - does not touch the working tree.
+       Used for rollback: "redeploy" restores this content, then reconciles it like any
+       other config. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$RepoDir, [Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Version)
+
+    $fullRepo = (Resolve-Path -LiteralPath $RepoDir).Path.TrimEnd('\', '/')
+    $fullPath = (Resolve-Path -LiteralPath $Path).Path
+    if (-not $fullPath.StartsWith($fullRepo, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Path is not under $RepoDir"
+    }
+    $relPath = $fullPath.Substring($fullRepo.Length).TrimStart('\', '/') -replace '\\', '/'
+
+    # Not "$(& git ...)" - that joins multi-line native output with a space (via $OFS),
+    # collapsing every commit onto one bogus line. Let PowerShell's own line-array capture
+    # through instead.
+    $shas = @(& git -C $RepoDir log --format=%H -- $relPath) | Where-Object { $_ }
+    if (-not $shas) { throw "No git history for $relPath under $RepoDir" }
+
+    foreach ($sha in $shas) {
+        $lines = & git -C $RepoDir show "${sha}:${relPath}" 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $lines) { continue }
+        $content = ($lines -join "`n")
+        try { $raw = ConvertFrom-Yaml $content -Ordered } catch { continue }
+        $v = Get-DictValue $raw 'configVersion'
+        if ("$v" -eq $Version) { return [pscustomobject]@{ Commit = $sha; Content = $content } }
+    }
+    throw "No commit of $relPath has configVersion '$Version' (searched $($shas.Count) commit(s))"
 }
 
 function Invoke-ApimConfigCommit {
@@ -1197,5 +1346,7 @@ Export-ModuleMember -Function @(
     'Write-ApimPlan', 'Invoke-AnypointCli', 'Resolve-ApimEnvironmentName',
     'Get-ApimEnvironmentId', 'Get-ApimInstanceId', 'Get-ApimAppliedPolicy',
     'Get-ApimAppliedPolicyViaRest', 'Get-ApimBaseUri', 'Get-ApimAccessToken',
-    'New-ApimInstance', 'Invoke-ApimPromotion', 'Get-ApimInitialEnv'
+    'New-ApimInstance', 'Invoke-ApimPromotion', 'Get-ApimInitialEnv',
+    'Write-ApimConfigFile', 'Step-ApimConfigVersion', 'Set-ApimConfigVersion',
+    'Get-ApimConfigAtVersion', 'Get-ApimExchangeAssetSpec', 'Invoke-ApimSpecLint'
 )

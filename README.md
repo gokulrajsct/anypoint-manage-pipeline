@@ -43,6 +43,49 @@ Set `prune: false` to have it reported as drift instead of deleted.
 **ordering cannot be changed** by this tool. Order mismatches are surfaced as warnings;
 fix them in the API Manager UI or via the REST API.
 
+**Spec validation (NZ Government API Standard).** Before reconciling, the pipeline runs
+`action: validate-spec`: it downloads the Exchange spec for `apiInstance.assetId` /
+`assetVersion` and lints it with [Spectral](https://github.com/stoplightio/spectral)
+against [`spec-rules/`](spec-rules), checking the rules in the
+[New Zealand Government API Standard](https://standards.digital.govt.nz/docref/api-standard/2026-09-01/en/)
+that are actually machine-checkable from an OpenAPI document — the standard has plenty of
+runtime/operational requirements (TLS version, token lifetime, API key length, ...) that no
+spec linter can verify, those are out of scope here. What is checked, every time
+regardless of classification:
+- **HTTP Requirements** — every response declares Content-Type; every request that carries
+  a body (PATCH/POST/PUT/DELETE) declares Content-Type; endpoint paths read as nouns, not
+  verbs (heuristic, warn-only).
+- **Resource Design** — resource path segments are lower case (path parameters like
+  `{orderId}` are exempt).
+- **Versioning** — a URL-versioned path uses `/vN` (major version only); agencies must not
+  put a minor version number in the URL path.
+- **Data Validation** — declared `application/json` request/response bodies carry a schema
+  (warn-only).
+
+Which ruleset applies is picked by `apiInstance.classification`
+(`internal` / `external` / `partner` / `public` — unset defaults to `public`, the
+strictest); the four categories come from the standard's own audience classification. On
+top of the base rules above, each tier file also requires an **Authentication and
+Authorisation** security scheme (`oauth2` or `openIdConnect` specifically, per the
+standard's OAuth 2.1 mandate) at error severity for `public`/`external`/`partner` and warn
+for `internal`.
+A spec-lint failure stops the pipeline before anything is deployed — see
+[`spec-rules/nz-api-standard.base.yaml`](spec-rules/nz-api-standard.base.yaml) for exactly
+which rules are enforced, their severity, and which are this project's own policy layered
+on top of the standard (the per-classification severity tiering itself, and the verb/schema
+checks which are heuristics rather than exact clauses).
+
+**Versioning.** Each config file carries its own `configVersion` (independent of
+`apiInstance.assetVersion`, the Exchange spec version) — starts at `1.0.0`, patch-bumped by
+every applied `reconcile`/`redeploy` (`1.0.0 → 1.0.1 → …`) and committed back to the config
+repo, with a `<api>-<env>-v<version>.json` snapshot of what was applied published as a
+build artifact. **Rollback = `action: redeploy`** with `targetVersion` set to an earlier
+`configVersion`: it restores that version's file content from git history and reconciles
+it — a successful redeploy is itself a new deployment, so the version keeps advancing
+(redeploying `1.0.1` on top of `1.0.5` becomes `1.0.6`, not a reset) and git history stays
+the complete record. Redeploying into `preprod`/`prod` is gated by the same Approvals check
+as a normal deploy.
+
 ---
 
 ## Config repo layout
@@ -72,12 +115,14 @@ picks the one file per API that matters for a given run, and is omitted only for
 [`config/orders-api/apimanager/test.yaml`](config/orders-api/apimanager/test.yaml).
 
 ```yaml
+configVersion: "1.0.4"            # this file's own deploy history; auto patch-bumped, do not hand-edit
 apiInstance:
   assetId: orders-api             # Exchange asset id of the API spec
   groupId: null                   # null -> current org (ANYPOINT_ORG)
   assetVersion: "1.0.3"
   instanceLabel: orders-api-uat   # unique per env; the lookup key
   deploymentType: cloudhub2       # cloudhub | cloudhub2 | hybrid | rtf
+  classification: external        # internal | external | partner | public - picks the validate-spec ruleset tier
   endpoint:
     implementationUri: https://orders-backend.uat/   # --uri
     type: http                                       # --type
@@ -144,8 +189,13 @@ the config file.
 4. **Connected App** (client-credentials grant), per business group / env — scopes:
    *API Manager: View APIs Configuration, Manage APIs Configuration, Manage Policies*;
    for promotion the same scopes on the **source** environment too.
-5. **Config-repo push** (for `action: extract`): grant the build service **Contribute** on
-   the config repo; the extract job checks out with `persistCredentials: true`.
+5. **Config-repo push**: grant the build service **Contribute** on the config repo. Needed
+   for `action: extract`, and now also for `deploy`/`redeploy` — a real (non-dry-run)
+   reconcile commits its `configVersion` bump back. Every job that pushes checks out
+   `configRepo` with `persistCredentials: true`.
+6. **Spectral** (for the spec-validate step): no extra credentials — it's installed from
+   npm in the job and reads the Exchange spec with the same Connected App used for the
+   policy read, over the REST API.
 
 Each job installs `anypoint-cli-v4` + the `api-mgr` plugin and the `powershell-yaml`
 module, then runs `Invoke-ApimSync.ps1`.
@@ -154,10 +204,11 @@ module, then runs `Invoke-ApimSync.ps1`.
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `action` | `deploy` | `deploy` = run the Test→UAT→PreProd→Prod stages; `extract` = pull live policies from the initial env and commit them |
-| `targetEnvironment` | `test` | how far a `deploy` run promotes (`test` / `uat` / `preprod` / `prod`) — later stages are skipped by `condition` |
+| `action` | `deploy` | `deploy` = validate-spec + run the Test→UAT→PreProd→Prod stages; `extract` = pull live policies from the initial env and commit them; `redeploy` = roll `targetEnvironment` back to `targetVersion` |
+| `targetEnvironment` | `test` | `deploy`: how far a run promotes (`test`/`uat`/`preprod`/`prod`) — later stages skipped by `condition`. `redeploy`: which single environment to roll back |
+| `targetVersion` | *(none)* | **`redeploy` only** — the `configVersion` to restore (e.g. `1.0.3`); required for that action, ignored otherwise |
 | `apiKey` | `SELECT_ONE` | **dropdown** — pick exactly one API folder (e.g. `orders-api`). No "all": every run deploys/extracts exactly one API. Leaving it on `SELECT_ONE` fails fast with a clear error |
-| `dryRun` | `true` | `true` = plan only, no changes. For `extract`, `true` = write + commit locally but do **not** push |
+| `dryRun` | `true` | `true` = plan only, no changes (also skips the configVersion bump). For `extract`, `true` = write + commit locally but do **not** push |
 | `createMode` | `auto` | `auto` (scratch in the initial env, promote elsewhere) / `scratch` / `promote` |
 | `prune` | `fromconfig` | override the per-API `prune` flag |
 
@@ -198,7 +249,7 @@ anypoint-cli-v4 plugins:install anypoint-cli-api-mgr-plugin
 Install-Module powershell-yaml -Scope CurrentUser -Force
 Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser -Force -SkipPublisherCheck
 
-Invoke-Pester ./tests          # 62 tests, no network (Anypoint CLI / REST mocked)
+Invoke-Pester ./tests          # 78 tests, no network (Anypoint CLI / REST mocked; version/rollback tests use real local git repos)
 ```
 
 Offline config check (every environment file for every API under `./config`):
@@ -211,10 +262,12 @@ Against a real sandbox — copy `local/.env.example` to `local/.env`, fill it, t
 
 ```powershell
 ./local/run-local.ps1 -Action login-check                  # verify creds, list envs
+./local/run-local.ps1 -Env test -Api orders-api -Action validate-spec   # NZ API Standard spec lint
 ./local/run-local.ps1 -Env test -Api orders-api            # dry-run reconcile (prints plan)
-./local/run-local.ps1 -Env test -Api orders-api -Apply     # apply
+./local/run-local.ps1 -Env test -Api orders-api -Apply     # apply (bumps + commits configVersion if -Commit/-Push given)
 ./local/run-local.ps1 -Env uat  -Api orders-api            # dry-run the promote path
 ./local/run-local.ps1 -Env test -Api orders-api -Action extract   # live -> config file
+./local/run-local.ps1 -Env test -Api orders-api -Action redeploy -TargetVersion 1.0.3 -RepoRoot ../config-repo -Apply
 ```
 
 ---
@@ -223,19 +276,25 @@ Against a real sandbox — copy `local/.env.example` to `local/.env`, fill it, t
 
 | File | Responsibility |
 |---|---|
-| `Invoke-ApimSync.ps1` | entry point: `reconcile` / `extract` / `validate` / `login-check` |
+| `Invoke-ApimSync.ps1` | entry point: `reconcile` / `extract` / `validate` / `validate-spec` / `redeploy` / `login-check` |
 | `src/ApimSync/ApimSync.psm1` | the module — everything below |
-| &nbsp;&nbsp;`Read-ApimConfig`, `Get-ApimConfigList` | load + validate config (YAML or JSON) |
+| &nbsp;&nbsp;`Read-ApimConfig`, `Get-ApimConfigList` | load + validate config (YAML or JSON); reads `configVersion` / `apiInstance.classification` |
 | &nbsp;&nbsp;`ConvertTo-ApimNormalizedPolicy` | normalise desired / live policy to a comparable shape |
 | &nbsp;&nbsp;`ConvertFrom-ApimConfigBlob` | parse the CLI's stringified `Configuration` table cell (fallback path) |
 | &nbsp;&nbsp;`Test-ApimConfigTreeEqual` / `Get-ApimConfigTreeDiff` | deep config compare + per-field diff log, mask-aware |
 | &nbsp;&nbsp;`Get-ApimPolicyPlan` | desired vs live → Add / Edit / Remove / Toggle / Drift plan |
 | &nbsp;&nbsp;`Invoke-AnypointCli` | run `anypoint-cli-v4`, capture JSON, surface errors |
 | &nbsp;&nbsp;`Get-ApimAccessToken` / `Invoke-ApimRest` / `Get-ApimAppliedPolicyViaRest` | REST read path (token + policies GET) |
+| &nbsp;&nbsp;`Get-ApimExchangeAssetSpec` / `Invoke-ApimSpecLint` | spec-validate: download the Exchange spec, lint it with Spectral against `spec-rules/` |
 | &nbsp;&nbsp;`Get-ApimInstanceId` / `New-ApimInstance` / `Invoke-ApimPromotion` / `Get-ApimAppliedPolicy` / `Add`/`Set`/`Remove-ApimPolicy` | CLI wrappers (`Get-ApimAppliedPolicy` = REST with CLI fallback) |
 | &nbsp;&nbsp;`Invoke-ApimReconcile` | orchestration: exists? → create/promote → apply plan → verify |
 | &nbsp;&nbsp;`Export-ApimConfig` | live policies (same REST read) → config-file `policies:` list; drops read-artifact keys, keeps/`CHANGE_ME`-stubs apply-only keys like jwt-validation `textKey` |
+| &nbsp;&nbsp;`Step-ApimConfigVersion` / `Set-ApimConfigVersion` | patch-bump `configVersion` (`1.0.0`→`1.0.1`) and write it back |
+| &nbsp;&nbsp;`Get-ApimConfigAtVersion` | rollback lookup: walk git history for the commit at a given `configVersion` |
 | &nbsp;&nbsp;`Invoke-ApimConfigCommit` | stage / commit / push updated config files — `-Branch` has no hardcoded default; omit it and a push goes to whichever branch is currently checked out |
+| `spec-rules/nz-api-standard.*.yaml` | Spectral rulesets for the NZ Govt API Standard, one per `apiInstance.classification` tier |
+| `pipelines/templates/redeploy-job.yml` | rollback job: `-Action redeploy -TargetVersion` |
+| `pipelines/Update-ApiKeyList.ps1` | regenerate the `apiKey` dropdown from the config repo's actual API folders |
 
 ### Exit codes
 

@@ -1,0 +1,101 @@
+# Reusable job: roll one api/environment back to an earlier configVersion.
+#
+# Same secrets/variable group as reconcile-job.yml (anypoint-<env>). Binds to the same
+# `environment: anypoint-<env>` ADO Environment, so a redeploy into preprod/prod is gated
+# by the same Approvals check as a normal deploy - nothing extra to configure.
+#
+# -Action redeploy restores <api>/apimanager/<env>.yaml to its content at configVersion
+# (found via git history of that file) and reconciles it; a successful redeploy is itself
+# a new deployment, so configVersion advances again rather than resetting.
+
+parameters:
+  - name: environment
+    type: string
+  - name: apiKey
+    type: string
+  - name: targetVersion
+    type: string
+  - name: dryRun
+    type: boolean
+  - name: createMode
+    type: string
+  - name: prune
+    type: string
+  - name: initialEnv
+    type: string
+  - name: pipelineDir
+    type: string
+  - name: configDir
+    type: string
+  - name: configBranch
+    type: string
+
+jobs:
+  - deployment: redeploy_${{ parameters.environment }}
+    displayName: redeploy ${{ parameters.environment }} to ${{ parameters.targetVersion }}
+    pool:
+      vmImage: ubuntu-latest
+    environment: anypoint-${{ parameters.environment }}
+    variables:
+      - group: anypoint-${{ parameters.environment }}
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - checkout: self
+              path: s/pipeline
+            - checkout: configRepo
+              path: s/config-repo
+              persistCredentials: true
+
+            - task: NodeTool@0
+              inputs:
+                versionSpec: '20.x'
+              displayName: Use Node 20
+
+            - bash: |
+                set -euo pipefail
+                npm install -g anypoint-cli-v4
+                anypoint-cli-v4 plugins:install anypoint-cli-api-mgr-plugin
+                pwsh -NoProfile -Command "Install-Module powershell-yaml -Scope CurrentUser -Force -AllowClobber"
+                echo "--- versions (unpinned install - record for troubleshooting) ---"
+                anypoint-cli-v4 --version
+                anypoint-cli-v4 plugins
+              displayName: Install Anypoint CLI + powershell-yaml
+
+            - pwsh: |
+                if ([string]::IsNullOrWhiteSpace("${{ parameters.targetVersion }}")) {
+                  Write-Host "##vso[task.logissue type=error]targetVersion is required for -Action redeploy"
+                  exit 1
+                }
+              displayName: Require targetVersion
+
+            - pwsh: |
+                ./Invoke-ApimSync.ps1 -Action redeploy `
+                  -Environment "${{ parameters.environment }}" `
+                  -ConfigDir "${{ parameters.configDir }}" `
+                  -Api "${{ parameters.apiKey }}" `
+                  -TargetVersion "${{ parameters.targetVersion }}" `
+                  -CreateMode "${{ parameters.createMode }}" `
+                  -Prune "${{ parameters.prune }}" `
+                  -ArtifactDir "$(Build.ArtifactStagingDirectory)/versions" `
+                  -RepoDir "${{ parameters.configDir }}" `
+                  -Branch "${{ parameters.configBranch }}" `
+                  -Commit `
+                  -Push:$${{ eq(parameters.dryRun, false) }} `
+                  -DryRun:$${{ parameters.dryRun }}
+              displayName: 'Redeploy ${{ parameters.environment }} to ${{ parameters.targetVersion }} (dryRun=${{ parameters.dryRun }})'
+              workingDirectory: ${{ parameters.pipelineDir }}
+              env:
+                ANYPOINT_CLIENT_ID: $(ANYPOINT_CLIENT_ID)
+                ANYPOINT_CLIENT_SECRET: $(ANYPOINT_CLIENT_SECRET)
+                ANYPOINT_ORG: $(ANYPOINT_ORG)
+                APIM_ENV_MAP: $(APIM_ENV_MAP)
+                APIM_INITIAL_ENV: ${{ parameters.initialEnv }}
+                GIT_COMMITTER_NAME: "Azure Pipelines"
+                GIT_COMMITTER_EMAIL: "build@noreply.local"
+
+            - publish: $(Build.ArtifactStagingDirectory)/versions
+              artifact: redeploy-version-${{ parameters.environment }}
+              displayName: Publish applied-version snapshot
+              condition: succeededOrFailed()

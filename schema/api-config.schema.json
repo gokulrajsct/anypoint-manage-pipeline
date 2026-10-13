@@ -18,6 +18,11 @@
         "productVersion": { "type": ["string", "null"] },
         "instanceLabel": { "type": "string", "minLength": 1 },
         "deploymentType": { "type": "string", "enum": ["cloudhub", "cloudhub2", "hybrid", "rtf"] },
+        "classification": {
+          "type": ["string", "null"],
+          "enum": ["internal", "external", "partner", "public", null],
+          "description": "NZ Government API Standard audience classification - picks which spec-lint ruleset tier applies. internal: used only by known internal staff/contractors. external: used by customers/developers outside the org. partner: used by contracted business partners. public: open to anyone meeting access-control requirements. Unset = treated as 'public' (strictest) by the spec-validate step."
+        },
         "endpoint": {
           "type": "object",
           "additionalProperties": false,
@@ -47,6 +52,11 @@
       }
     },
     "prune": { "type": "boolean" },
+    "configVersion": {
+      "type": ["string", "null"],
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "Semver for this config file's own deployment history (independent of apiInstance.assetVersion, the Exchange spec version). Auto patch-bumped by reconcile on every applied (non-dry-run, non-empty-plan) run and committed back - e.g. 1.0.0 -> 1.0.1. Defaults to 1.0.0 if absent. Used to label the per-run artifact and as the rollback target for -Action redeploy."
+    },
     "policies": {
       "type": "array",
       "items": {

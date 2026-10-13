@@ -1,0 +1,26 @@
+# Internal tier: used solely within the organisation by known internal staff or
+# contractors (NZ API Standard classification). Still inside the org's own trust
+# boundary, so a missing security requirement is flagged but not build-breaking - warn,
+# not error. See nz-api-standard.public.yaml for the note on this tiering being this
+# project's own policy, not a clause quoted from the standard.
+extends: ["./nz-api-standard.base.yaml"]
+rules:
+  nz-security-scheme-required:
+    description: "Internal API: a security requirement is still recommended on every operation, even though this tier doesn't fail the build for a missing one."
+    message: "{{path}}: operation has no security requirement declared (recommended even for internal APIs)"
+    severity: warn
+    given: "$.paths[*][get,put,post,delete,patch]"
+    then:
+      field: security
+      function: truthy
+
+  nz-oauth2-scheme-required:
+    description: "NZ API Standard, Authentication and Authorisation: where a client must be authorised to use an API, agencies MUST use OAuth 2.1 (OpenID Connect also acceptable). Still recommended for internal APIs, even though this tier doesn't fail the build for an apiKey/http-only scheme."
+    message: "securityScheme '{{property}}' is type '{{value}}' - OAuth 2.1 (oauth2) or openIdConnect is recommended even for internal APIs"
+    severity: warn
+    given: "$.components.securitySchemes[*]"
+    then:
+      field: type
+      function: enumeration
+      functionOptions:
+        values: ["oauth2", "openIdConnect"]

@@ -11,6 +11,10 @@
 #
 # The job's `environment: anypoint-<env>` binds to an ADO Environment - put the
 # approval checks on anypoint-preprod and anypoint-prod there.
+#
+# A real (non-dry-run) reconcile patch-bumps the config's configVersion and pushes that
+# back to the config repo - the build service identity needs "Contribute" there, same as
+# the Extract job.
 
 parameters:
   - name: environment
@@ -29,6 +33,8 @@ parameters:
     type: string
   - name: configDir
     type: string
+  - name: configBranch
+    type: string
 
 jobs:
   - deployment: reconcile_${{ parameters.environment }}
@@ -43,10 +49,12 @@ jobs:
         deploy:
           steps:
             # Azure DevOps clones both repos here - nothing clones in the scripts.
+            # persistCredentials: the configVersion bump below pushes back to this repo.
             - checkout: self
               path: s/pipeline
             - checkout: configRepo
               path: s/config-repo
+              persistCredentials: true
 
             - task: NodeTool@0
               inputs:
@@ -57,11 +65,13 @@ jobs:
                 set -euo pipefail
                 npm install -g anypoint-cli-v4
                 anypoint-cli-v4 plugins:install anypoint-cli-api-mgr-plugin
+                npm install -g @stoplight/spectral-cli
                 pwsh -NoProfile -Command "Install-Module powershell-yaml -Scope CurrentUser -Force -AllowClobber"
                 echo "--- versions (unpinned install - record for troubleshooting) ---"
                 anypoint-cli-v4 --version
                 anypoint-cli-v4 plugins
-              displayName: Install Anypoint CLI + powershell-yaml
+                spectral --version
+              displayName: Install Anypoint CLI + Spectral + powershell-yaml
 
             - pwsh: |
                 ./Invoke-ApimSync.ps1 -Action validate `
@@ -71,6 +81,19 @@ jobs:
               workingDirectory: ${{ parameters.pipelineDir }}
 
             - pwsh: |
+                ./Invoke-ApimSync.ps1 -Action validate-spec `
+                  -Environment "${{ parameters.environment }}" `
+                  -ConfigDir "${{ parameters.configDir }}" `
+                  -Api "${{ parameters.apiKey }}"
+              displayName: Validate API spec (NZ Govt API Standard)
+              workingDirectory: ${{ parameters.pipelineDir }}
+              env:
+                ANYPOINT_CLIENT_ID: $(ANYPOINT_CLIENT_ID)
+                ANYPOINT_CLIENT_SECRET: $(ANYPOINT_CLIENT_SECRET)
+                ANYPOINT_ORG: $(ANYPOINT_ORG)
+                ANYPOINT_HOST: $(ANYPOINT_HOST)
+
+            - pwsh: |
                 ./Invoke-ApimSync.ps1 -Action reconcile `
                   -Environment "${{ parameters.environment }}" `
                   -ConfigDir "${{ parameters.configDir }}" `
@@ -78,6 +101,11 @@ jobs:
                   -CreateMode "${{ parameters.createMode }}" `
                   -Prune "${{ parameters.prune }}" `
                   -PlanOut "$(Build.ArtifactStagingDirectory)/plan-${{ parameters.environment }}.json" `
+                  -ArtifactDir "$(Build.ArtifactStagingDirectory)/versions" `
+                  -RepoDir "${{ parameters.configDir }}" `
+                  -Branch "${{ parameters.configBranch }}" `
+                  -Commit `
+                  -Push:$${{ eq(parameters.dryRun, false) }} `
                   -DryRun:$${{ parameters.dryRun }}
               displayName: 'Reconcile ${{ parameters.environment }} (dryRun=${{ parameters.dryRun }})'
               workingDirectory: ${{ parameters.pipelineDir }}
@@ -87,8 +115,15 @@ jobs:
                 ANYPOINT_ORG: $(ANYPOINT_ORG)
                 APIM_ENV_MAP: $(APIM_ENV_MAP)
                 APIM_INITIAL_ENV: ${{ parameters.initialEnv }}
+                GIT_COMMITTER_NAME: "Azure Pipelines"
+                GIT_COMMITTER_EMAIL: "build@noreply.local"
 
             - publish: $(Build.ArtifactStagingDirectory)/plan-${{ parameters.environment }}.json
               artifact: reconcile-plan-${{ parameters.environment }}
               displayName: Publish plan
               condition: always()
+
+            - publish: $(Build.ArtifactStagingDirectory)/versions
+              artifact: reconcile-version-${{ parameters.environment }}
+              displayName: Publish applied-version snapshot
+              condition: succeededOrFailed()
