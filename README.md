@@ -75,6 +75,14 @@ which rules are enforced, their severity, and which are this project's own polic
 on top of the standard (the per-classification severity tiering itself, and the verb/schema
 checks which are heuristics rather than exact clauses).
 
+`validate-spec` needs an actual spec file (OAS/RAML/WSDL) attached to the Exchange asset -
+it has nothing to lint otherwise. A true spec-less Exchange "HTTP API" asset (no OAS/RAML/
+WSDL file at all) will make it fail with "has no files to validate". For that case only,
+set `apiInstance.skipSpecValidation: true` to opt that one api/env out - this is a
+deliberate, audited escape hatch (it logs a `##vso[task.logissue type=warning]` line so a
+skip is visible in the pipeline run, not silent), not a way to silence a real lint failure.
+Prefer attaching a spec, even a minimal one, over reaching for this flag.
+
 **Versioning.** Each config file carries its own `configVersion` (independent of
 `apiInstance.assetVersion`, the Exchange spec version) — starts at `1.0.0`, patch-bumped by
 every applied `reconcile`/`redeploy` (`1.0.0 → 1.0.1 → …`) and committed back to the config
@@ -123,6 +131,7 @@ apiInstance:
   instanceLabel: orders-api-uat   # unique per env; the lookup key
   deploymentType: cloudhub2       # cloudhub | cloudhub2 | hybrid | rtf
   classification: external        # internal | external | partner | public - picks the validate-spec ruleset tier
+  skipSpecValidation: false       # true only for a spec-less Exchange "HTTP API" asset - see Spec validation above
   endpoint:
     implementationUri: https://orders-backend.uat/   # --uri
     type: http                                       # --type

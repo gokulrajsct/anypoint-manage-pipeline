@@ -23,6 +23,10 @@
           "enum": ["internal", "external", "partner", "public", null],
           "description": "NZ Government API Standard audience classification - picks which spec-lint ruleset tier applies. internal: used only by known internal staff/contractors. external: used by customers/developers outside the org. partner: used by contracted business partners. public: open to anyone meeting access-control requirements. Unset = treated as 'public' (strictest) by the spec-validate step."
         },
+        "skipSpecValidation": {
+          "type": ["boolean", "null"],
+          "description": "Opt out of the -Action validate-spec step for this api/env - e.g. a true spec-less Exchange 'HTTP API' asset with no OAS/RAML/WSDL file attached, which validate-spec cannot fetch or lint. Default false. This is a deliberate, per-api escape hatch, not a way to silence a real lint failure - prefer attaching a (even minimal) OAS spec to the Exchange asset instead."
+        },
         "endpoint": {
           "type": "object",
           "additionalProperties": false,

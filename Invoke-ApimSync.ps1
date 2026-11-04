@@ -168,6 +168,11 @@ try {
             Require-SingleApi $Api
             $c = @(Get-ApimConfigList -ConfigDir $ConfigDir -Api $Api -Environment $Environment)[0]
 
+            if ($c.ApiInstance.skipSpecValidation) {
+                Write-Host "##vso[task.logissue type=warning]$($c.Key): apiInstance.skipSpecValidation is true - skipping the NZ Government API Standard spec lint. This is a deliberate per-api opt-out (e.g. a spec-less Exchange 'HTTP API' asset); prefer attaching an OAS spec instead of leaving this set."
+                exit 0
+            }
+
             $classification = "$($c.ApiInstance.classification)"
             if (-not $classification) { $classification = 'public' }   # unset -> strictest tier
             $rulesetFile = Join-Path $PSScriptRoot "spec-rules/nz-api-standard.$classification.yaml"

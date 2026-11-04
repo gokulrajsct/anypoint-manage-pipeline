@@ -308,6 +308,7 @@ function Read-ApimConfig {
     if ($classification -and ($script:ApiClassifications -notcontains "$classification")) {
         throw "${Path}: invalid apiInstance.classification '$classification' (allowed: $($script:ApiClassifications -join ', '))"
     }
+    $inst['skipSpecValidation'] = ConvertTo-ApimBool (Get-DictValue $inst 'skipSpecValidation')
 
     $configVersion = Get-DictValue $raw 'configVersion'
     if (-not $configVersion) { $configVersion = '1.0.0' }

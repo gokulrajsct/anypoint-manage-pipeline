@@ -85,6 +85,47 @@ policies: []
         $c.ApiInstance.classification | Should -Be 'external'
     }
 
+    It 'defaults skipSpecValidation to false when absent' {
+        $p = Join-Path $TestDrive 'no-skip.yaml'
+        @'
+apiInstance:
+  assetId: x
+  assetVersion: "1.0.0"
+  instanceLabel: x-dev
+policies: []
+'@ | Set-Content -LiteralPath $p
+        $c = Read-ApimConfig -Path $p
+        $c.ApiInstance.skipSpecValidation | Should -BeFalse
+    }
+
+    It 'coerces skipSpecValidation: "false" (string) to a real false' {
+        $p = Join-Path $TestDrive 'skip-string-false.yaml'
+        @'
+apiInstance:
+  assetId: x
+  assetVersion: "1.0.0"
+  instanceLabel: x-dev
+  skipSpecValidation: "false"
+policies: []
+'@ | Set-Content -LiteralPath $p
+        $c = Read-ApimConfig -Path $p
+        $c.ApiInstance.skipSpecValidation | Should -BeFalse
+    }
+
+    It 'reads skipSpecValidation: true' {
+        $p = Join-Path $TestDrive 'skip-true.yaml'
+        @'
+apiInstance:
+  assetId: x
+  assetVersion: "1.0.0"
+  instanceLabel: x-dev
+  skipSpecValidation: true
+policies: []
+'@ | Set-Content -LiteralPath $p
+        $c = Read-ApimConfig -Path $p
+        $c.ApiInstance.skipSpecValidation | Should -BeTrue
+    }
+
     It 'rejects an invalid classification' {
         $p = Join-Path $TestDrive 'bad-class.yaml'
         @'
