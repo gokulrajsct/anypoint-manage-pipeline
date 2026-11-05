@@ -69,7 +69,11 @@ top of the base rules above, each tier file also requires an **Authentication an
 Authorisation** security scheme (`oauth2` or `openIdConnect` specifically, per the
 standard's OAuth 2.1 mandate) at error severity for `public`/`external`/`partner` and warn
 for `internal`.
-A spec-lint failure stops the pipeline before anything is deployed — see
+A mismatch against the standard is a warning, not a pipeline failure: every finding is
+logged (`[spec] ERROR|WARN|INFO|HINT ...`) and, if any are error-severity, also raised as an
+ADO warning annotation — but `validate-spec` always exits 0 and reconcile still runs. Only a
+genuine tool failure (spectral missing, a broken ruleset, no output produced at all) stops
+the pipeline, since that's not "the spec doesn't match," it's "the check couldn't run." See
 [`spec-rules/nz-api-standard.base.yaml`](spec-rules/nz-api-standard.base.yaml) for exactly
 which rules are enforced, their severity, and which are this project's own policy layered
 on top of the standard (the per-classification severity tiering itself, and the verb/schema

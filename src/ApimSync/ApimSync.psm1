@@ -655,14 +655,20 @@ function Get-ApimExchangeAssetSpec {
     if (-not $file.downloadURL) { throw "Exchange asset $GroupId/$AssetId/${AssetVersion}: spec file has no downloadURL" }
 
     Write-Host "[spec] downloading '$($file.classifier)' spec for $AssetId@$AssetVersion"
-    Invoke-WebRequest -Uri "$($file.downloadURL)" -OutFile $OutFile -UseBasicParsing | Out-Null
+    # The asset-metadata GET above needs a bearer token; the file itself is behind the same
+    # auth unless the asset is flagged fully public in Exchange - send it here too, or a
+    # non-public asset's download comes back 401 even though the metadata call succeeded.
+    Invoke-WebRequest -Uri "$($file.downloadURL)" -OutFile $OutFile -UseBasicParsing `
+        -Headers @{ Authorization = "Bearer $(Get-ApimAccessToken)" } | Out-Null
     return [pscustomobject]@{ Path = $OutFile; Classifier = "$($file.classifier)" }
 }
 
 function Invoke-ApimSpecLint {
     <# Run `spectral lint` against a downloaded spec with a classification-tiered ruleset.
-       Throws (with every finding already logged) if any error-severity finding comes back;
-       otherwise returns the finding list (may include warn/info/hint entries). #>
+       A spec mismatch is advisory, not a pipeline failure: every finding (any severity) is
+       logged and returned, never thrown on. Only a genuine tool failure - spectral producing
+       no output at all (bad ruleset, missing CLI, crash) - throws, since that isn't a "the
+       spec doesn't match the standard" situation the caller can just warn about. #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$SpecFile, [Parameter(Mandatory)][string]$RulesetFile)
 
@@ -677,16 +683,16 @@ function Invoke-ApimSpecLint {
     }
     finally { Remove-Item -LiteralPath $outFile -ErrorAction SilentlyContinue }
 
-    $results = if ($json) { @($json | ConvertFrom-Json) } else { @() }
+    if (-not $json) {
+        throw "spectral produced no output against '$RulesetFile' (exit $code) - this looks like a tool or ruleset failure, not a spec finding; see [spec] lines above"
+    }
+
+    $results = @($json | ConvertFrom-Json)
     $sevNames = @('ERROR', 'WARN', 'INFO', 'HINT')
     foreach ($r in $results) {
         $sev = if ($null -ne $r.severity -and [int]$r.severity -lt $sevNames.Count) { $sevNames[[int]$r.severity] } else { '?' }
         $path = if ($r.path) { ($r.path -join '.') } else { '(root)' }
         Write-Host "[spec] $sev $($r.code) at $path : $($r.message)"
-    }
-    $errors = @($results | Where-Object { [int]$_.severity -eq 0 })
-    if ($errors.Count -gt 0 -or $code -ne 0) {
-        throw "Spec lint failed against '$RulesetFile': $($errors.Count) error-severity finding(s) (see [spec] lines above)"
     }
     return $results
 }

@@ -49,7 +49,7 @@ parameters:
     values: [test, uat, preprod, prod]
 
   - name: targetVersion
-    displayName: configVersion to redeploy (redeploy only, e.g. 1.0.3) - ignored otherwise
+    displayName: "REDEPLOY ONLY - configVersion to restore, e.g. 1.0.3. Leave blank for deploy/extract."
     type: string
     default: ''
 

@@ -4,7 +4,10 @@
 # nz-security-scheme-required and nz-oauth2-scheme-required - at a severity that depends
 # on the API's audience tier.
 # Everything in this file is checked here regardless of classification. Each rule is
-# traceable to a specific normative sentence in the standard (MUST = error, SHOULD = warn):
+# traceable to a specific normative sentence in the standard (MUST = error, SHOULD = warn).
+# That severity is informational only - it labels a finding in the console log and, for
+# error-severity findings, in an ADO warning annotation - it does not fail the pipeline.
+# validate-spec always exits 0; see Invoke-ApimSync.ps1's validate-spec action.
 #   - HTTP Requirements: every response MUST declare Content-Type; requests that carry a
 #     body (PATCH/POST/PUT/DELETE) MUST declare Content-Type; endpoint URLs MUST advertise
 #     resources (nouns), not verbs.

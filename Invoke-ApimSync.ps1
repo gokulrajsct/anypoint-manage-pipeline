@@ -142,6 +142,13 @@ Write-Host "clientId set=$([bool]$env:ANYPOINT_CLIENT_ID) clientSecret set=$([bo
 Write-Host "PSVersion=$($PSVersionTable.PSVersion) OS=$($PSVersionTable.OS)"
 Write-Host "=================="
 
+# -TargetVersion only ever does anything for -Action redeploy (see that case below); flag it
+# rather than silently ignore it, in case someone filled it in expecting it to matter for
+# deploy/extract/reconcile too.
+if ($TargetVersion -and $Action -ne 'redeploy') {
+    Write-Host "##vso[task.logissue type=warning]-TargetVersion '$TargetVersion' was provided but -Action is '$Action' - it has no effect except for -Action redeploy."
+}
+
 try {
     switch ($Action) {
 
@@ -187,10 +194,19 @@ try {
                 -AssetVersion $c.ApiInstance.assetVersion -OutFile $specFile
             Write-Host "[spec] $($c.Key): classification=$classification ruleset=nz-api-standard.$classification.yaml spec=$($spec.Classifier)"
             try {
-                Invoke-ApimSpecLint -SpecFile $spec.Path -RulesetFile $rulesetFile | Out-Null
+                $lintResults = Invoke-ApimSpecLint -SpecFile $spec.Path -RulesetFile $rulesetFile
             }
             finally { Remove-Item -LiteralPath $specFile -ErrorAction SilentlyContinue }
-            Write-Host "Spec OK against the NZ Government API Standard ($classification tier)."
+
+            # A mismatch against the standard is a warning, not a pipeline failure - it's
+            # surfaced loudly (console + an ADO warning annotation) but never blocks reconcile.
+            $specErrors = @($lintResults | Where-Object { [int]$_.severity -eq 0 })
+            if ($specErrors.Count -gt 0) {
+                Write-Host "##vso[task.logissue type=warning]$($c.Key): $($specErrors.Count) finding(s) against the NZ Government API Standard ($classification tier) - see [spec] lines above. Not blocking the pipeline."
+            }
+            else {
+                Write-Host "Spec OK against the NZ Government API Standard ($classification tier)."
+            }
             exit 0
         }
 
