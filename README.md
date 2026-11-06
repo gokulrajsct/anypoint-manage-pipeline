@@ -43,6 +43,15 @@ Set `prune: false` to have it reported as drift instead of deleted.
 **ordering cannot be changed** by this tool. Order mismatches are surfaced as warnings;
 fix them in the API Manager UI or via the REST API.
 
+**Applying the same policy more than once.** `policies:` can list the same `assetId`
+multiple times - e.g. one `jwt-validation` instance per path, each authorising a different
+set of roles via its own `pointcutData`. Each instance is tracked by its `assetId` *and*
+its pointcut, so they're reconciled independently; two entries must not resolve to the
+exact same pointcut, though - `Read-ApimConfig` rejects that at validate time (it's what
+Anypoint itself would reject on apply with "the policy defines a pointcut already defined
+by a policy with the same characteristics"). A lone (non-repeated) policy is unaffected -
+changing its pointcut is still a single in-place edit, not a remove-and-re-add.
+
 **Spec validation (NZ Government API Standard).** Before reconciling, the pipeline runs
 `action: validate-spec`: it downloads the Exchange spec for `apiInstance.assetId` /
 `assetVersion` and lints it with [Spectral](https://github.com/stoplightio/spectral)

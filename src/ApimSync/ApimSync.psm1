@@ -320,6 +320,13 @@ function Read-ApimConfig {
     $rawPolicies = Get-DictValue $raw 'policies'
     if ($rawPolicies) { $policies = @($rawPolicies) }
     $idx = 0
+    # The same assetId CAN legitimately appear more than once (one instance per path/role,
+    # e.g. jwt-validation applied separately to /admin/* and /public/*) - Resolve-ApimPolicyKeys
+    # tracks those as distinct entities by pointcut. But two entries with the SAME assetId
+    # AND the exact same pointcut is a real config mistake Anypoint will reject on apply
+    # ("the policy defines a pointcut already defined by a policy with the same
+    # characteristics") - catch it here with a clear message instead.
+    $seenSlots = @{}
     foreach ($p in $policies) {
         $idx++
         foreach ($req in @('assetId', 'version')) {
@@ -329,6 +336,13 @@ function Read-ApimConfig {
             throw "${Path}: policies[$idx].configurationData is required (use {} for none)"
         }
         if ($null -eq (Get-DictValue $p 'order')) { $p['order'] = $idx }
+
+        $gid = Get-DictValue $p 'groupId'; if (-not $gid) { $gid = $script:MuleSoftGroupId }
+        $slotKey = '{0}:{1}::{2}' -f $gid, (Get-DictValue $p 'assetId'), (ConvertTo-ApimPointcutJson (Get-DictValue $p 'pointcutData'))
+        if ($seenSlots.ContainsKey($slotKey)) {
+            throw "${Path}: policies[$($seenSlots[$slotKey])] and policies[$idx] both apply '$(Get-DictValue $p 'assetId')' to the exact same pointcut - give them different pointcutData, or Anypoint will reject the duplicate on apply"
+        }
+        $seenSlots[$slotKey] = $idx
     }
 
     $promotion = Get-DictValue $raw 'promotion'
@@ -857,8 +871,16 @@ function ConvertTo-ApimNormalizedPolicy {
         $instanceId = Get-FirstValue $d @('policyId', 'id', 'ID')
     }
 
+    # Key starts equal to BaseKey (groupId:assetId) and is the identity Get-ApimPolicyPlan
+    # matches Desired against Live with. Resolve-ApimPolicyKeys may extend Key with a
+    # pointcut fingerprint afterwards, for an assetId that's deliberately applied more than
+    # once (e.g. one jwt-validation instance per path/role) - BaseKey stays the plain form so
+    # per-policy lookups like $script:PolicyConfigDiffIgnore (keyed by "groupId:assetId")
+    # keep working no matter how Key ends up.
+    $baseKey = ('{0}:{1}' -f $groupId, $assetId)
     [pscustomobject]@{
-        Key          = ('{0}:{1}' -f $groupId, $assetId)
+        Key          = $baseKey
+        BaseKey      = $baseKey
         GroupId      = "$groupId"
         AssetId      = "$assetId"
         Version      = $version
@@ -932,6 +954,38 @@ function Remove-ApimIgnoredConfigKey {
     return $out
 }
 
+function Resolve-ApimPolicyKeys {
+    <# The same policy template can be deliberately applied more than once - e.g. one
+       jwt-validation instance per path, each authorising a different set of roles via its
+       own pointcutData. Key starts out as BaseKey (groupId:assetId) for every policy, which
+       is fine as long as an assetId appears at most once on each side: it lets a pointcut
+       change on a lone instance go through as an in-place "policy edit --pointcut" instead
+       of a remove+add.
+       It breaks down the moment an assetId appears more than once on either side though:
+       Get-ApimPolicyPlan's liveByKey/desiredKeys dictionaries can only hold one entry per
+       key, so every instance beyond the first silently disappears from tracking - which is
+       exactly how a plan ends up trying to ADD a policy Anypoint already has an identical
+       twin of ("the policy defines a pointcut already defined by a policy with the same
+       characteristics").
+       Fix: for any BaseKey that appears more than once in Desired OR more than once in
+       Live, extend Key (on every policy sharing that BaseKey, both sides) with a canonical
+       pointcut fingerprint, so each distinct pointcut is tracked as its own entity. A
+       BaseKey that appears at most once on each side is left alone, so the common
+       single-instance case is unaffected. #>
+    param([object[]]$Desired = @(), [object[]]$Live = @())
+
+    $multi = @{}
+    foreach ($group in @($Desired, $Live)) {
+        $seen = @{}
+        foreach ($p in $group) {
+            if ($seen.ContainsKey($p.Key)) { $multi[$p.Key] = $true } else { $seen[$p.Key] = $true }
+        }
+    }
+    foreach ($p in (@($Desired) + @($Live))) {
+        if ($multi.ContainsKey($p.Key)) { $p.Key = "$($p.Key)::$($p.PointcutJson)" }
+    }
+}
+
 function Get-ApimPolicyPlan {
     [CmdletBinding()]
     param([object[]]$Desired = @(), [object[]]$Live = @(), [bool]$Prune = $true)
@@ -951,8 +1005,8 @@ function Get-ApimPolicyPlan {
             $add += $dp
             continue
         }
-        $dCfg = Remove-ApimIgnoredConfigKey $dp.Config $dp.Key
-        $lCfg = Remove-ApimIgnoredConfigKey $lp.Config $lp.Key
+        $dCfg = Remove-ApimIgnoredConfigKey $dp.Config $dp.BaseKey
+        $lCfg = Remove-ApimIgnoredConfigKey $lp.Config $lp.BaseKey
         $cfgEqual = Test-ApimConfigTreeEqual $dCfg $lCfg
         if ($lp.PointcutKnown) {
             $pcEqual = ($dp.PointcutJson -eq $lp.PointcutJson)
@@ -1041,6 +1095,7 @@ function Assert-ApimConverged {
     $liveRaw = Get-ApimAppliedPolicy -EnvName $EnvName -InstanceId $InstanceId
     $desired = @($Config.Policies | ForEach-Object { ConvertTo-ApimNormalizedPolicy -Raw $_ -Kind Desired })
     $live = @($liveRaw | ForEach-Object { ConvertTo-ApimNormalizedPolicy -Raw $_ -Kind Live })
+    Resolve-ApimPolicyKeys -Desired $desired -Live $live
     $residual = Get-ApimPolicyPlan -Desired $desired -Live $live -Prune $Prune
     if (-not $residual.IsEmpty) {
         throw "Post-apply verification failed for '$($Config.ApiInstance.instanceLabel)'. Residual plan is not empty."
@@ -1105,6 +1160,7 @@ function Invoke-ApimReconcile {
     $desired = @($Config.Policies | ForEach-Object { ConvertTo-ApimNormalizedPolicy -Raw $_ -Kind Desired }) |
         Sort-Object { if ($null -ne $_.Order) { $_.Order } else { [int]::MaxValue } }
     $live = @($liveRaw | ForEach-Object { ConvertTo-ApimNormalizedPolicy -Raw $_ -Kind Live })
+    Resolve-ApimPolicyKeys -Desired $desired -Live $live
     $plan = Get-ApimPolicyPlan -Desired @($desired) -Live @($live) -Prune $prune
     $result.Plan = $plan
     $result.Drift = $plan.Drift
@@ -1164,16 +1220,21 @@ function Export-ApimConfig {
 
     $liveRaw = Get-ApimAppliedPolicy -EnvName $envName -InstanceId $instanceId
 
+    # Same disambiguation as reconcile: an assetId applied more than once (e.g. one
+    # jwt-validation instance per path/role) needs its pointcut folded into the match key,
+    # or every instance beyond the first collapses onto the same "existing" config entry -
+    # which would restore the wrong prior textKey/masked value for whichever instance lost
+    # the collision.
+    $existingNormalized = @($Config.Policies | ForEach-Object { ConvertTo-ApimNormalizedPolicy -Raw $_ -Kind Desired })
+    $liveNormalized = @($liveRaw | ForEach-Object { ConvertTo-ApimNormalizedPolicy -Raw $_ -Kind Live })
+    Resolve-ApimPolicyKeys -Desired $existingNormalized -Live $liveNormalized
+
     $existingByKey = @{}
-    foreach ($p in @($Config.Policies)) {
-        $gid = Get-DictValue $p 'groupId'; if (-not $gid) { $gid = $script:MuleSoftGroupId }
-        $existingByKey[('{0}:{1}' -f $gid, (Get-DictValue $p 'assetId'))] = $p
-    }
+    for ($i = 0; $i -lt $existingNormalized.Count; $i++) { $existingByKey[$existingNormalized[$i].Key] = @($Config.Policies)[$i] }
 
     $warnings = @()
     $entries = @()
-    foreach ($raw in $liveRaw) {
-        $n = ConvertTo-ApimNormalizedPolicy -Raw $raw -Kind Live
+    foreach ($n in $liveNormalized) {
         $prior = if ($existingByKey.ContainsKey($n.Key)) { $existingByKey[$n.Key] } else { $null }
         $priorCfg = if ($prior) { Get-DictValue $prior 'configurationData' } else { $null }
         $restored = Restore-ApimMaskedValue (ConvertTo-CanonicalObject $n.Config) $priorCfg
@@ -1188,7 +1249,7 @@ function Export-ApimConfig {
             foreach ($k in $rd.Keys) {
                 if ($script:PolicyConfigDiffIgnoreCommon -notcontains "$k") { $kept["$k"] = $rd["$k"] }
             }
-            foreach ($ik in @($script:PolicyConfigDiffIgnore[$n.Key] | Where-Object { $_ })) {
+            foreach ($ik in @($script:PolicyConfigDiffIgnore[$n.BaseKey] | Where-Object { $_ })) {
                 if ($kept.Contains($ik)) { continue }
                 if (($null -ne $pd) -and $pd.Contains($ik)) {
                     $kept[$ik] = $pd[$ik]
@@ -1348,7 +1409,7 @@ function Invoke-ApimConfigCommit {
 Export-ModuleMember -Function @(
     'Read-ApimConfig', 'Get-ApimConfigList',
     'Invoke-ApimReconcile', 'Export-ApimConfig', 'Invoke-ApimConfigCommit',
-    'Get-ApimPolicyPlan', 'ConvertTo-ApimNormalizedPolicy', 'Test-ApimConfigTreeEqual',
+    'Get-ApimPolicyPlan', 'Resolve-ApimPolicyKeys', 'ConvertTo-ApimNormalizedPolicy', 'Test-ApimConfigTreeEqual',
     'Get-ApimConfigTreeDiff', 'ConvertFrom-ApimConfigBlob',
     'Write-ApimPlan', 'Invoke-AnypointCli', 'Resolve-ApimEnvironmentName',
     'Get-ApimEnvironmentId', 'Get-ApimInstanceId', 'Get-ApimAppliedPolicy',

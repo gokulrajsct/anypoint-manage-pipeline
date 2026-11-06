@@ -126,6 +126,55 @@ policies: []
         $c.ApiInstance.skipSpecValidation | Should -BeTrue
     }
 
+    It 'allows the same assetId twice with different pointcutData (one instance per path/role)' {
+        $p = Join-Path $TestDrive 'multi-pointcut.yaml'
+        @'
+apiInstance:
+  assetId: x
+  assetVersion: "1.0.0"
+  instanceLabel: x-dev
+policies:
+  - assetId: jwt-validation
+    version: "1.3.0"
+    pointcutData:
+      - methodRegex: GET
+        uriTemplateRegex: /admin/.*
+    configurationData: {}
+  - assetId: jwt-validation
+    version: "1.3.0"
+    pointcutData:
+      - methodRegex: GET
+        uriTemplateRegex: /public/.*
+    configurationData: {}
+'@ | Set-Content -LiteralPath $p
+        $c = Read-ApimConfig -Path $p
+        $c.Policies.Count | Should -Be 2
+    }
+
+    It 'rejects the same assetId twice with the exact same pointcutData' {
+        $p = Join-Path $TestDrive 'dup-pointcut.yaml'
+        @'
+apiInstance:
+  assetId: x
+  assetVersion: "1.0.0"
+  instanceLabel: x-dev
+policies:
+  - assetId: jwt-validation
+    version: "1.3.0"
+    pointcutData:
+      - methodRegex: GET
+        uriTemplateRegex: /admin/.*
+    configurationData: {}
+  - assetId: jwt-validation
+    version: "1.3.0"
+    pointcutData:
+      - methodRegex: GET
+        uriTemplateRegex: /admin/.*
+    configurationData: {}
+'@ | Set-Content -LiteralPath $p
+        { Read-ApimConfig -Path $p } | Should -Throw -ExpectedMessage '*same pointcut*'
+    }
+
     It 'rejects an invalid classification' {
         $p = Join-Path $TestDrive 'bad-class.yaml'
         @'
@@ -666,17 +715,17 @@ Describe 'Get-ApimBaseUri' {
 Describe 'Get-ApimPolicyPlan' {
 
     BeforeAll {
-        function New-Desired ($asset, $ver, $cfg, $order = 1, $disabled = $false) {
+        function New-Desired ($asset, $ver, $cfg, $order = 1, $disabled = $false, $pointcut = $null) {
             ConvertTo-ApimNormalizedPolicy -Kind Desired -Raw ([ordered]@{
                     assetId = $asset; version = $ver; groupId = 'G'; order = $order
-                    disabled = $disabled; configurationData = $cfg
+                    disabled = $disabled; configurationData = $cfg; pointcutData = $pointcut
                 })
         }
-        function New-Live ($asset, $ver, $cfg, $order = 1, $disabled = $false, $instanceId = 100) {
+        function New-Live ($asset, $ver, $cfg, $order = 1, $disabled = $false, $instanceId = 100, $pointcut = $null) {
             ConvertTo-ApimNormalizedPolicy -Kind Live -Raw ([ordered]@{
                     id = $instanceId; order = $order; disabled = $disabled
                     template = [ordered]@{ groupId = 'G'; assetId = $asset; version = $ver }
-                    configurationData = $cfg
+                    configurationData = $cfg; pointcutData = $pointcut
                 })
         }
     }
@@ -741,6 +790,106 @@ Describe 'Get-ApimPolicyPlan' {
             -Live @(New-Live 'rl' '1.0' @{ x = 1 } 1) -Prune $true
         $plan.IsEmpty            | Should -BeTrue
         $plan.OrderWarnings.Count | Should -Be 1
+    }
+
+    Context 'the same assetId applied more than once (one instance per path/role)' {
+        # Reproduces the real bug: groupId:assetId alone collapses two live jwt-validation
+        # instances onto one tracked entry, so the plan ends up trying to ADD a policy
+        # Anypoint already has an identical twin of ("the policy defines a pointcut already
+        # defined by a policy with the same characteristics"). Resolve-ApimPolicyKeys must
+        # run before Get-ApimPolicyPlan to track each pointcut as its own entity.
+
+        It 'both instances already live and matching -> empty plan (not a false Add)' {
+            $desired = @(
+                (New-Desired 'jwt-validation' '1.3.0' @{ role = 'admin' } 1 $false @(@{ methodRegex = 'GET'; uriTemplateRegex = '/admin/.*' })),
+                (New-Desired 'jwt-validation' '1.3.0' @{ role = 'public' } 2 $false @(@{ methodRegex = 'GET'; uriTemplateRegex = '/public/.*' }))
+            )
+            $live = @(
+                (New-Live 'jwt-validation' '1.3.0' @{ role = 'admin' } 1 $false 201 @(@{ methodRegex = 'GET'; uriTemplateRegex = '/admin/.*' })),
+                (New-Live 'jwt-validation' '1.3.0' @{ role = 'public' } 2 $false 202 @(@{ methodRegex = 'GET'; uriTemplateRegex = '/public/.*' }))
+            )
+            Resolve-ApimPolicyKeys -Desired $desired -Live $live
+            $plan = Get-ApimPolicyPlan -Desired $desired -Live $live -Prune $true
+            $plan.IsEmpty | Should -BeTrue
+        }
+
+        It 'one instance missing live -> adds only that one, leaves the other alone' {
+            $desired = @(
+                (New-Desired 'jwt-validation' '1.3.0' @{ role = 'admin' } 1 $false @(@{ methodRegex = 'GET'; uriTemplateRegex = '/admin/.*' })),
+                (New-Desired 'jwt-validation' '1.3.0' @{ role = 'public' } 2 $false @(@{ methodRegex = 'GET'; uriTemplateRegex = '/public/.*' }))
+            )
+            $live = @(
+                (New-Live 'jwt-validation' '1.3.0' @{ role = 'admin' } 1 $false 201 @(@{ methodRegex = 'GET'; uriTemplateRegex = '/admin/.*' }))
+            )
+            Resolve-ApimPolicyKeys -Desired $desired -Live $live
+            $plan = Get-ApimPolicyPlan -Desired $desired -Live $live -Prune $true
+            $plan.Add.Count          | Should -Be 1
+            $plan.Add[0].Config.role | Should -Be 'public'
+            $plan.Remove.Count       | Should -Be 0
+            $plan.Edit.Count         | Should -Be 0
+        }
+
+        It 'config change on one instance edits only that instance' {
+            $desired = @(
+                (New-Desired 'jwt-validation' '1.3.0' @{ role = 'admin-v2' } 1 $false @(@{ methodRegex = 'GET'; uriTemplateRegex = '/admin/.*' })),
+                (New-Desired 'jwt-validation' '1.3.0' @{ role = 'public' } 2 $false @(@{ methodRegex = 'GET'; uriTemplateRegex = '/public/.*' }))
+            )
+            $live = @(
+                (New-Live 'jwt-validation' '1.3.0' @{ role = 'admin' } 1 $false 201 @(@{ methodRegex = 'GET'; uriTemplateRegex = '/admin/.*' })),
+                (New-Live 'jwt-validation' '1.3.0' @{ role = 'public' } 2 $false 202 @(@{ methodRegex = 'GET'; uriTemplateRegex = '/public/.*' }))
+            )
+            Resolve-ApimPolicyKeys -Desired $desired -Live $live
+            $plan = Get-ApimPolicyPlan -Desired $desired -Live $live -Prune $true
+            $plan.Edit.Count         | Should -Be 1
+            $plan.Edit[0].InstanceId | Should -Be '201'
+            $plan.Add.Count          | Should -Be 0
+            $plan.Remove.Count       | Should -Be 0
+        }
+
+        It 'a lone single instance still edits its pointcut in place (no false collision)' {
+            $desired = @(New-Desired 'jwt-validation' '1.3.0' @{ role = 'x' } 1 $false @(@{ methodRegex = 'GET'; uriTemplateRegex = '/new/.*' }))
+            $live    = @(New-Live 'jwt-validation' '1.3.0' @{ role = 'x' } 1 $false 300 @(@{ methodRegex = 'GET'; uriTemplateRegex = '/old/.*' }))
+            Resolve-ApimPolicyKeys -Desired $desired -Live $live
+            $plan = Get-ApimPolicyPlan -Desired $desired -Live $live -Prune $true
+            $plan.Edit.Count      | Should -Be 1
+            $plan.Edit[0].Changes | Should -Contain 'pointcut'
+            $plan.Add.Count       | Should -Be 0
+            $plan.Remove.Count    | Should -Be 0
+        }
+    }
+}
+
+Describe 'Resolve-ApimPolicyKeys' {
+    It 'leaves a single-instance assetId key untouched' {
+        $d = @([pscustomobject]@{ Key = 'G:rl'; PointcutJson = 'null' })
+        $l = @([pscustomobject]@{ Key = 'G:rl'; PointcutJson = 'null' })
+        Resolve-ApimPolicyKeys -Desired $d -Live $l
+        $d[0].Key | Should -Be 'G:rl'
+        $l[0].Key | Should -Be 'G:rl'
+    }
+
+    It 'extends the key with the pointcut fingerprint when an assetId repeats on either side' {
+        $d = @(
+            [pscustomobject]@{ Key = 'G:jwt'; PointcutJson = '[{"a":1}]' },
+            [pscustomobject]@{ Key = 'G:jwt'; PointcutJson = '[{"a":2}]' }
+        )
+        $l = @([pscustomobject]@{ Key = 'G:jwt'; PointcutJson = '[{"a":1}]' })
+        Resolve-ApimPolicyKeys -Desired $d -Live $l
+        $d[0].Key | Should -Be 'G:jwt::[{"a":1}]'
+        $d[1].Key | Should -Be 'G:jwt::[{"a":2}]'
+        $l[0].Key | Should -Be 'G:jwt::[{"a":1}]'
+    }
+
+    It 'repetition on Live alone is enough to extend the key on both sides' {
+        $d = @([pscustomobject]@{ Key = 'G:jwt'; PointcutJson = '[{"a":1}]' })
+        $l = @(
+            [pscustomobject]@{ Key = 'G:jwt'; PointcutJson = '[{"a":1}]' },
+            [pscustomobject]@{ Key = 'G:jwt'; PointcutJson = '[{"a":2}]' }
+        )
+        Resolve-ApimPolicyKeys -Desired $d -Live $l
+        $d[0].Key | Should -Be 'G:jwt::[{"a":1}]'
+        $l[0].Key | Should -Be 'G:jwt::[{"a":1}]'
+        $l[1].Key | Should -Be 'G:jwt::[{"a":2}]'
     }
 }
 
