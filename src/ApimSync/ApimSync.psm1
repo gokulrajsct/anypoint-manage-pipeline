@@ -1358,7 +1358,7 @@ function Get-ApimConfigAtVersion {
     # Not "$(& git ...)" - that joins multi-line native output with a space (via $OFS),
     # collapsing every commit onto one bogus line. Let PowerShell's own line-array capture
     # through instead.
-    $shas = @(& git -C $RepoDir log --format=%H -- $relPath) | Where-Object { $_ }
+    $shas = @(@(& git -C $RepoDir log --format=%H -- $relPath) | Where-Object { $_ })
     if (-not $shas) { throw "No git history for $relPath under $RepoDir" }
 
     foreach ($sha in $shas) {
