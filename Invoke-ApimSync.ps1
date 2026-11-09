@@ -256,8 +256,14 @@ try {
             $hist = Get-ApimConfigAtVersion -RepoDir $RepoDir -Path $c.Path -Version $TargetVersion
             $shortSha = $hist.Commit.Substring(0, [Math]::Min(8, $hist.Commit.Length))
             Write-Host "[redeploy] $($c.Key)/${Environment}: restoring configVersion $TargetVersion from commit $shortSha"
+            $prevVersion = $c.ConfigVersion
             Set-Content -LiteralPath $c.Path -Value $hist.Content -Encoding utf8
             $restored = Read-ApimConfig -Path $c.Path -ApiKey $c.Key
+            # Bump forward from the file's version *before* this redeploy overwrote it, not
+            # from the restored target's own old version number - otherwise redeploying an
+            # old version re-mints a configVersion that may already belong to a different
+            # commit's content further up history, breaking "configVersion is unique".
+            $restored.ConfigVersion = $prevVersion
 
             $result = Invoke-ApplyAndVersion -Config $restored -Env $Environment
             $hasDrift = $result.Drift.Count -gt 0
