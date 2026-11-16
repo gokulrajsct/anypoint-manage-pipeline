@@ -555,7 +555,9 @@ function New-ApimInstance {
 
     $res = Invoke-AnypointCli -ArgumentList $args -AsJson
     Set-ApimApiContext $res
-    return "$($res.id)"
+    $id = Get-FirstValue $res @('id', 'apiId', 'instanceId')
+    if (-not $id) { throw "api-mgr api manage did not return a recognizable instance id. Raw response: $($res | ConvertTo-Json -Depth 10 -Compress)" }
+    return "$id"
 }
 
 function Invoke-ApimPromotion {
@@ -575,7 +577,12 @@ function Invoke-ApimPromotion {
         '--output', 'json')
     $res = Invoke-AnypointCli -ArgumentList $args -AsJson
     Set-ApimApiContext $res
-    return "$($res.id)"
+    # `api promote`'s JSON shape isn't guaranteed to be a flat {id: ...} the way `api manage`
+    # (create) is - try the field names we've actually seen before failing, and when none
+    # match, show the real response instead of a bare "property 'id' not found" crash.
+    $id = Get-FirstValue $res @('id', 'apiId', 'instanceId')
+    if (-not $id) { throw "api-mgr api promote did not return a recognizable instance id. Raw response: $($res | ConvertTo-Json -Depth 10 -Compress)" }
+    return "$id"
 }
 
 # --------------------------------------------------------------------------- #
