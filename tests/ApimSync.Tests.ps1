@@ -960,7 +960,7 @@ Describe 'Invoke-ApimReconcile (dry run, CLI mocked)' {
     It 'missing instance in a higher env -> promote plan' {
         Mock -ModuleName ApimSync Get-ApimInstanceId {
             param($EnvName, $InstanceLabel)
-            if ($InstanceLabel -eq 'orders-api-uat') { $null } else { '555' }
+            if ($InstanceLabel -like 'orders-api-uat*') { $null } else { '555' }
         }
         Mock -ModuleName ApimSync Get-ApimEnvironmentId { 'ENV-TEST-ID' }
         Mock -ModuleName ApimSync Get-ApimAppliedPolicy { @() }
@@ -974,13 +974,18 @@ Describe 'Invoke-ApimReconcile (dry run, CLI mocked)' {
     }
 
     It 'promote rejected as a duplicate (pre-check missed an existing target instance) -> recovers by looking it up, does not re-promote' {
-        $script:uatLookupCalls = 0
+        $script:uatLookupCalls = @{}
         Mock -ModuleName ApimSync Get-ApimInstanceId {
             param($EnvName, $InstanceLabel)
-            if ($InstanceLabel -ne 'orders-api-uat') { return '555' }   # source instance lookup
-            $script:uatLookupCalls++
-            if ($script:uatLookupCalls -eq 1) { return $null }          # initial pre-check: false negative
-            return '999'                                                # recovery lookup after Anypoint rejects the promote
+            if ($InstanceLabel -notlike 'orders-api-uat*') { return '555' }   # source instance lookup
+            if (-not $script:uatLookupCalls.ContainsKey($InstanceLabel)) { $script:uatLookupCalls[$InstanceLabel] = 0 }
+            $script:uatLookupCalls[$InstanceLabel]++
+            # Clean label: null on the first probe (the pre-check's false negative), found on
+            # the second (the recovery lookup) - without ever needing the "(promoted)" mangled
+            # form, which is a different scenario covered by Resolve-ApimPromotedInstanceId's
+            # own tests.
+            if ($InstanceLabel -eq 'orders-api-uat' -and $script:uatLookupCalls[$InstanceLabel] -ge 2) { return '999' }
+            return $null
         }
         Mock -ModuleName ApimSync Get-ApimEnvironmentId { 'ENV-TEST-ID' }
         Mock -ModuleName ApimSync Get-ApimAppliedPolicy { @() }
@@ -993,6 +998,42 @@ Describe 'Invoke-ApimReconcile (dry run, CLI mocked)' {
         $r.InstanceId | Should -Be '999'
         Should -Invoke -ModuleName ApimSync Invoke-ApimPromotion -Times 1
         Should -Invoke -ModuleName ApimSync Get-ApimInstanceId -ParameterFilter { $InstanceLabel -eq 'orders-api-uat' } -Times 2
+    }
+}
+
+Describe 'Resolve-ApimPromotedInstanceId' {
+    # Anypoint's own `api promote` renames the new instance to "<label> (promoted)" instead
+    # of keeping the source's label - these lock in finding it under that mangled form and
+    # renaming it back, without ever needing a live org.
+
+    It 'finds the instance directly when the clean label already matches' {
+        Mock -ModuleName ApimSync Get-ApimInstanceId {
+            param($EnvName, $InstanceLabel)
+            if ($InstanceLabel -eq 'orders-api-uat') { '42' } else { $null }
+        }
+        Mock -ModuleName ApimSync Invoke-AnypointCli { throw 'must not call api edit when the clean label already matched' }
+
+        Resolve-ApimPromotedInstanceId -EnvName uat -Label 'orders-api-uat' | Should -Be '42'
+    }
+
+    It 'falls back to the "(promoted)" label and renames the instance back to the clean label' {
+        Mock -ModuleName ApimSync Get-ApimInstanceId {
+            param($EnvName, $InstanceLabel)
+            if ($InstanceLabel -eq 'orders-api-uat (promoted)') { '42' } else { $null }
+        }
+        Mock -ModuleName ApimSync Invoke-AnypointCli { '{}' }
+
+        Resolve-ApimPromotedInstanceId -EnvName uat -Label 'orders-api-uat' | Should -Be '42'
+        Should -Invoke -ModuleName ApimSync Invoke-AnypointCli -ParameterFilter {
+            ($ArgumentList -join ' ') -eq 'api-mgr api edit 42 --apiInstanceLabel orders-api-uat --environment uat --output json'
+        } -Times 1
+    }
+
+    It 'returns null when the instance exists under neither label' {
+        Mock -ModuleName ApimSync Get-ApimInstanceId { $null }
+        Mock -ModuleName ApimSync Invoke-AnypointCli { throw 'must not call api edit when nothing was found' }
+
+        Resolve-ApimPromotedInstanceId -EnvName uat -Label 'orders-api-uat' | Should -BeNullOrEmpty
     }
 }
 

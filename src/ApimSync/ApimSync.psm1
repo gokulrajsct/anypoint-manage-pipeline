@@ -513,6 +513,28 @@ function Get-ApimInstanceId {
     return $null
 }
 
+function Resolve-ApimPromotedInstanceId {
+    <# `api-mgr api promote` does not keep the source instance's label verbatim - Anypoint
+       appends " (promoted)" to it, so the exact config label is never there right after a
+       promote and every later lookup by that clean label keeps missing it. Try the clean
+       label first (already fixed up, or never needed it), then the mangled form Anypoint
+       actually assigns; if found only under the mangled form, rename it back via
+       `api edit --apiInstanceLabel` so every later lookup - and the user's own view in API
+       Manager - uses the clean, config-matching label from here on. #>
+    param([Parameter(Mandatory)][string]$EnvName, [Parameter(Mandatory)][string]$Label)
+    $id = Get-ApimInstanceId -EnvName $EnvName -InstanceLabel $Label
+    if ($id) { return $id }
+    $mangled = "$Label (promoted)"
+    $id = Get-ApimInstanceId -EnvName $EnvName -InstanceLabel $mangled
+    if ($id) {
+        Write-Host "[promote] Anypoint labeled the instance '$mangled' - renaming it back to '$Label'."
+        Invoke-AnypointCli -ArgumentList @(
+            'api-mgr', 'api', 'edit', $id, '--apiInstanceLabel', $Label,
+            '--environment', $EnvName, '--output', 'json') -AsJson | Out-Null
+    }
+    return $id
+}
+
 function Set-ApimApiContext {
     <# Remember org/env ids from an API object so the REST policies call needs no extra lookup. #>
     param($ApiObject)
@@ -581,10 +603,12 @@ function Invoke-ApimPromotion {
     # promoted from "..." to "Bat"`). The promoted instance in $TargetEnvName gets its own,
     # different id that this response never reports, so look it up by label afterward - the
     # same way every other instance lookup in this module already works - instead of trying
-    # to parse an id field that doesn't exist.
+    # to parse an id field that doesn't exist. Anypoint also doesn't keep the source's
+    # instanceLabel verbatim on the new instance - it appends " (promoted)" - so look under
+    # that mangled form too, and rename back to the clean label when found there.
     $targetLabel = "$($Config.ApiInstance.instanceLabel)"
-    $id = Get-ApimInstanceId -EnvName $TargetEnvName -InstanceLabel $targetLabel
-    if (-not $id) { throw "Promoted into '$TargetEnvName' but could not find an instance labeled '$targetLabel' there afterwards." }
+    $id = Resolve-ApimPromotedInstanceId -EnvName $TargetEnvName -Label $targetLabel
+    if (-not $id) { throw "Promoted into '$TargetEnvName' but could not find an instance labeled '$targetLabel' or '$targetLabel (promoted)' there afterwards." }
     return "$id"
 }
 
@@ -1131,7 +1155,7 @@ function Invoke-ApimReconcile {
         Plan = $null; Drift = @(); Messages = @()
     }
 
-    $instanceId = Get-ApimInstanceId -EnvName $envName -InstanceLabel $label
+    $instanceId = Resolve-ApimPromotedInstanceId -EnvName $envName -Label $label
 
     if (-not $instanceId) {
         $how = Get-ApimCreateStrategy -CreateMode $CreateMode -Environment $Environment -Config $Config
@@ -1154,7 +1178,7 @@ function Invoke-ApimReconcile {
                     # missed (e.g. a listing/filter quirk) and Anypoint itself now rejects
                     # the promote as a duplicate, recover by looking it up directly instead
                     # of failing on a condition that isn't actually a problem.
-                    $instanceId = Get-ApimInstanceId -EnvName $envName -InstanceLabel $label
+                    $instanceId = Resolve-ApimPromotedInstanceId -EnvName $envName -Label $label
                     if (-not $instanceId) { throw "PROMOTE failed for '$label' from '$srcLogical/$srcLabel' (source instance $srcInstanceId) into '$Environment': $($_.Exception.Message)" }
                     Write-Host "[promote] '$label' already existed in '$Environment' (missed by the earlier check) - found instance $instanceId; reconciling policies instead of promoting again."
                     $result.Action = 'none'
@@ -1446,7 +1470,7 @@ Export-ModuleMember -Function @(
     'Get-ApimPolicyPlan', 'Resolve-ApimPolicyKeys', 'ConvertTo-ApimNormalizedPolicy', 'Test-ApimConfigTreeEqual',
     'Get-ApimConfigTreeDiff', 'ConvertFrom-ApimConfigBlob',
     'Write-ApimPlan', 'Invoke-AnypointCli', 'Resolve-ApimEnvironmentName',
-    'Get-ApimEnvironmentId', 'Get-ApimInstanceId', 'Get-ApimAppliedPolicy',
+    'Get-ApimEnvironmentId', 'Get-ApimInstanceId', 'Resolve-ApimPromotedInstanceId', 'Get-ApimAppliedPolicy',
     'Get-ApimAppliedPolicyViaRest', 'Get-ApimBaseUri', 'Get-ApimAccessToken',
     'New-ApimInstance', 'Invoke-ApimPromotion', 'Get-ApimInitialEnv',
     'Write-ApimConfigFile', 'Step-ApimConfigVersion', 'Set-ApimConfigVersion',
