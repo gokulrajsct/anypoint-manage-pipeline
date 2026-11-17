@@ -745,6 +745,253 @@ function Invoke-ApimSpecLint {
     return $results
 }
 
+# Rule code -> NZ Standard category this scorecard groups findings into. A rule code not
+# listed here (e.g. a future rule nobody updated this map for) falls into "Other" rather
+# than being silently dropped from the report - see ConvertTo-ApimSpecReportHtml below.
+$script:ApimSpecReportCategories = @(
+    @{ Name = 'Authentication'; Var = 'auth'
+       Rules = @('nz-security-scheme-required', 'nz-oauth2-scheme-required')
+       Icon = '<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>' }
+    @{ Name = 'Resource design'; Var = 'res'
+       Rules = @('nz-resource-path-lowercase', 'nz-resource-no-verbs-in-path')
+       Icon = '<path d="M3 12h18M3 6h18M3 18h18"/>' }
+    @{ Name = 'Data validation'; Var = 'data'
+       Rules = @('nz-json-schema-required-for-response', 'nz-json-schema-required-for-request-body')
+       Icon = '<path d="M9 12l2 2 4-4M12 3a9 9 0 1 0 9 9"/>' }
+    @{ Name = 'HTTP requirements'; Var = 'http'
+       Rules = @('nz-request-content-type-required', 'nz-response-content-type-required')
+       Icon = '<path d="M4 17V7l8-4 8 4v10l-8 4-8-4z"/><path d="M4 7l8 4 8-4M12 11v10"/>' }
+    @{ Name = 'Versioning'; Var = 'ver'
+       Rules = @('nz-url-version-major-only')
+       Icon = '<path d="M12 3v18M3 12h18"/>' }
+)
+
+function ConvertTo-ApimSpecReportHtml {
+    <# Render Invoke-ApimSpecLint's results as a colour-coded scorecard: a severity donut
+       + stat tiles, then one card per NZ Standard category (see $script:ApimSpecReportCategories),
+       each carrying its own accent hue. Written to -ArtifactDir by the validate-spec action
+       so the pipeline can publish it as a build artifact alongside the console [spec] lines.
+       Pure string building, no template engine - consistent with the rest of this module. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Api,
+        [Parameter(Mandatory)][string]$Environment,
+        [Parameter(Mandatory)][string]$Classification,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$LintResults
+    )
+
+    function HtmlEnc([string]$s) { [System.Net.WebUtility]::HtmlEncode($s) }
+
+    $findings = @($LintResults | ForEach-Object {
+        $sevNum = if ($null -ne $_.severity) { [int]$_.severity } else { 1 }
+        [pscustomobject]@{
+            Code     = "$($_.code)"
+            Severity = if ($sevNum -eq 0) { 'err' } else { 'warn' }
+            Path     = if ($_.path) { ($_.path -join '.') } else { '(root)' }
+            Message  = "$($_.message)"
+        }
+    })
+    $errCount = @($findings | Where-Object { $_.Severity -eq 'err' }).Count
+    $warnCount = @($findings | Where-Object { $_.Severity -eq 'warn' }).Count
+    $total = $findings.Count
+
+    $circ = 2 * [Math]::PI * 50
+    $warnLen = if ($total -gt 0) { [Math]::Round(($warnCount / $total) * $circ, 1) } else { 0 }
+    $errLen = if ($total -gt 0) { [Math]::Round(($errCount / $total) * $circ, 1) } else { 0 }
+    $errOffset = -$warnLen
+
+    function New-ApimSpecReportRow($f) {
+        "<tr><td><span class=`"sev $($f.Severity)`"></span></td><td style=`"display:block`">" +
+        "<span class=`"rule`">$(HtmlEnc $f.Code)</span>" +
+        "<span class=`"loc`">$(HtmlEnc $f.Path)</span>" +
+        "<div style=`"margin-top:4px`">$(HtmlEnc $f.Message)</div></td></tr>"
+    }
+
+    $catCards = ''
+    $usedCodes = @{}
+    foreach ($cat in $script:ApimSpecReportCategories) {
+        $catFindings = @($findings | Where-Object { $cat.Rules -contains $_.Code })
+        foreach ($f in $catFindings) { $usedCodes["$($f.Code)"] = $true }
+        if ($catFindings.Count -eq 0) { continue }
+        $catErr = @($catFindings | Where-Object { $_.Severity -eq 'err' }).Count
+        $badgeBg = if ($catErr -gt 0) { 'var(--err-soft)' } else { 'var(--warn-soft)' }
+        $badgeFg = if ($catErr -gt 0) { 'var(--err)' } else { 'var(--warn)' }
+        $rows = ($catFindings | ForEach-Object { New-ApimSpecReportRow $_ }) -join "`n"
+        $catCards += @"
+    <div class="cat">
+      <div class="cat-top" style="background:var(--cat-$($cat.Var))"></div>
+      <div class="cat-head">
+        <div class="cat-icon" style="background:var(--cat-$($cat.Var)-soft)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="var(--cat-$($cat.Var))" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">$($cat.Icon)</svg>
+        </div>
+        <h3>$(HtmlEnc $cat.Name)</h3>
+        <span class="count" style="background:$badgeBg;color:$badgeFg">$($catFindings.Count)</span>
+      </div>
+      <table>
+$rows
+      </table>
+    </div>
+"@
+    }
+    $other = @($findings | Where-Object { -not $usedCodes.ContainsKey($_.Code) })
+    if ($other.Count -gt 0) {
+        $catErr = @($other | Where-Object { $_.Severity -eq 'err' }).Count
+        $badgeBg = if ($catErr -gt 0) { 'var(--err-soft)' } else { 'var(--warn-soft)' }
+        $badgeFg = if ($catErr -gt 0) { 'var(--err)' } else { 'var(--warn)' }
+        $rows = ($other | ForEach-Object { New-ApimSpecReportRow $_ }) -join "`n"
+        $catCards += @"
+    <div class="cat" style="grid-column:1 / -1">
+      <div class="cat-top" style="background:var(--muted)"></div>
+      <div class="cat-head">
+        <div class="cat-icon" style="background:var(--line)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/></svg>
+        </div>
+        <h3>Other</h3>
+        <span class="count" style="background:$badgeBg;color:$badgeFg">$($other.Count)</span>
+      </div>
+      <table>
+$rows
+      </table>
+    </div>
+"@
+    }
+
+    $legend = ($script:ApimSpecReportCategories | ForEach-Object {
+        "<span><i style=`"background:var(--cat-$($_.Var))`"></i>$(HtmlEnc $_.Name)</span>"
+    }) -join "`n    "
+
+    $heroStats = if ($total -eq 0) {
+        '<div class="stat s-ok" style="grid-column:1 / -1"><div class="num">All clear</div><div class="lbl">no findings against the standard</div></div>'
+    }
+    else {
+        "<div class=`"stat s-err`"><div class=`"num`">$errCount</div><div class=`"lbl`">error&#8209;tier</div></div>" +
+        "<div class=`"stat s-warn`"><div class=`"num`">$warnCount</div><div class=`"lbl`">warn&#8209;tier</div></div>" +
+        '<div class="stat s-ok"><div class="num">0</div><div class="lbl">blocking the pipeline</div></div>'
+    }
+
+    $generated = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm \U\T\C')
+    $title = "$(HtmlEnc $Api) spec compliance"
+
+    @"
+<meta name="claude:viewport-fit-sides" content="cover">
+<title>$title</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+:root{
+  --ink:#171a21; --paper:#f4f5f3; --surface:#ffffff; --line:#e4e4df; --muted:#6b7280;
+  --err:#e11d48; --err-soft:#ffe4e9; --warn:#d97706; --warn-soft:#fef1da;
+  --cat-auth:#7c3aed; --cat-auth-soft:#efe6fd;
+  --cat-res:#0d9488; --cat-res-soft:#d9f3ef;
+  --cat-data:#ea580c; --cat-data-soft:#fde6d6;
+  --cat-http:#db2777; --cat-http-soft:#fbe0ec;
+  --cat-ver:#2563eb; --cat-ver-soft:#dde8fd;
+  --font-display:'IBM Plex Sans',Arial,sans-serif; --font-mono:'IBM Plex Mono',ui-monospace,Menlo,monospace;
+  color-scheme:light;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ink:#eceef2; --paper:#13151b; --surface:#1a1d25; --line:#2a2d38; --muted:#9298a8;
+    --err:#fb7185; --err-soft:#3a1a22; --warn:#f0b15c; --warn-soft:#3a2a12;
+    --cat-auth:#b29bf7; --cat-auth-soft:#2a2246;
+    --cat-res:#5fd0c2; --cat-res-soft:#133030;
+    --cat-data:#ff9c5c; --cat-data-soft:#3a2415;
+    --cat-http:#f488b9; --cat-http-soft:#3a1c2a;
+    --cat-ver:#7aa6fb; --cat-ver-soft:#1b2a4a;
+    color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --ink:#eceef2; --paper:#13151b; --surface:#1a1d25; --line:#2a2d38; --muted:#9298a8;
+  --err:#fb7185; --err-soft:#3a1a22; --warn:#f0b15c; --warn-soft:#3a2a12;
+  --cat-auth:#b29bf7; --cat-auth-soft:#2a2246;
+  --cat-res:#5fd0c2; --cat-res-soft:#133030;
+  --cat-data:#ff9c5c; --cat-data-soft:#3a2415;
+  --cat-http:#f488b9; --cat-http-soft:#3a1c2a;
+  --cat-ver:#7aa6fb; --cat-ver-soft:#1b2a4a;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+body{background:var(--paper);color:var(--ink);font-family:var(--font-display);line-height:1.45;
+  padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));}
+.wrap{max-width:1180px;margin:0 auto;padding-block:28px 72px}
+.mono{font-family:var(--font-mono)}
+h1{font-size:30px;font-weight:700;margin:0;text-wrap:balance}
+.topline{display:flex;flex-wrap:wrap;gap:14px;align-items:baseline;justify-content:space-between;margin-bottom:4px}
+.tags{display:flex;gap:8px;flex-wrap:wrap}
+.tag{font-size:12px;font-weight:600;padding:4px 11px;border-radius:40px;background:var(--surface);
+  border:1px solid var(--line);color:var(--muted);font-family:var(--font-mono)}
+.sub{color:var(--muted);font-size:14px;margin:6px 0 28px}
+.hero{display:grid;grid-template-columns:220px 1fr;gap:28px;margin-bottom:34px;align-items:center}
+.donut-card{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:20px;
+  display:flex;flex-direction:column;align-items:center;gap:6px;min-width:0}
+.donut-card .total{font-size:34px;font-weight:700;font-variant-numeric:tabular-nums}
+.donut-card .totlbl{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;min-width:0}
+.stat{border-radius:16px;padding:18px 20px;min-width:0;position:relative;overflow:hidden}
+.stat .num{font-size:30px;font-weight:700;font-variant-numeric:tabular-nums}
+.stat .lbl{font-size:13px;margin-top:2px;opacity:.85}
+.stat.s-err{background:linear-gradient(145deg,var(--err-soft),var(--surface));color:var(--err)}
+.stat.s-warn{background:linear-gradient(145deg,var(--warn-soft),var(--surface));color:var(--warn)}
+.stat.s-ok{background:linear-gradient(145deg,var(--cat-res-soft),var(--surface));color:var(--cat-res)}
+.stat .lbl{color:var(--ink);opacity:.65}
+.legend{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:26px}
+.legend span{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;color:var(--muted)}
+.legend i{width:9px;height:9px;border-radius:50%;display:inline-block}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:18px}
+.cat{background:var(--surface);border:1px solid var(--line);border-radius:16px;overflow:hidden;min-width:0;
+  box-shadow:0 1px 2px rgba(0,0,0,.04)}
+.cat-top{height:5px}
+.cat-head{display:flex;align-items:center;gap:12px;padding:16px 18px 12px}
+.cat-icon{width:36px;height:36px;border-radius:10px;display:flex;align-items:center;justify-content:center;flex:none}
+.cat-icon svg{width:19px;height:19px}
+.cat-head h3{font-size:16px;font-weight:700;margin:0}
+.cat-head .count{margin-left:auto;font-size:12px;font-weight:700;padding:3px 10px;border-radius:40px;font-family:var(--font-mono)}
+.cat table{width:100%;border-collapse:collapse;font-size:13.5px}
+.cat td{padding:9px 18px;border-top:1px solid var(--line);vertical-align:top}
+.cat tr:first-child td{border-top:none}
+.cat .rule{font-family:var(--font-mono);font-size:12.5px;display:block;margin-bottom:2px}
+.cat .loc{color:var(--muted);font-size:12px}
+.sev{display:inline-block;width:8px;height:8px;border-radius:50%;margin-top:5px}
+.sev.err{background:var(--err)} .sev.warn{background:var(--warn)}
+@media (max-width:760px){ .hero{grid-template-columns:1fr} .stats{grid-template-columns:repeat(3,1fr)} .grid{grid-template-columns:1fr} }
+@media (max-width:460px){ .stats{grid-template-columns:1fr 1fr} }
+</style>
+<div class="wrap">
+  <div class="topline">
+    <h1>$title</h1>
+    <div class="tags">
+      <span class="tag">classification: $(HtmlEnc $Classification)</span>
+      <span class="tag">env: $(HtmlEnc $Environment)</span>
+      <span class="tag">advisory only</span>
+    </div>
+  </div>
+  <p class="sub">validate-spec against the NZ Government API Standard &middot; generated $generated</p>
+  <div class="hero">
+    <div class="donut-card">
+      <svg viewBox="0 0 120 120" width="120" height="120">
+        <circle cx="60" cy="60" r="50" fill="none" stroke="var(--line)" stroke-width="14"/>
+        <circle cx="60" cy="60" r="50" fill="none" stroke="var(--warn)" stroke-width="14"
+          stroke-dasharray="$warnLen $([Math]::Round($circ,1))" stroke-dashoffset="0" transform="rotate(-90 60 60)" stroke-linecap="round"/>
+        <circle cx="60" cy="60" r="50" fill="none" stroke="var(--err)" stroke-width="14"
+          stroke-dasharray="$errLen $([Math]::Round($circ,1))" stroke-dashoffset="$errOffset" transform="rotate(-90 60 60)" stroke-linecap="round"/>
+      </svg>
+      <div class="total">$total</div>
+      <div class="totlbl">total findings</div>
+    </div>
+    <div class="stats">
+$heroStats
+    </div>
+  </div>
+  <div class="legend">
+    $legend
+  </div>
+  <div class="grid">
+$catCards
+  </div>
+</div>
+"@
+}
+
 function Get-ApimAppliedPolicyViaRest {
     param([Parameter(Mandatory)][string]$EnvName, [Parameter(Mandatory)][string]$InstanceId)
     $ctx = $script:ApimApiContext["$InstanceId"]
@@ -1474,5 +1721,5 @@ Export-ModuleMember -Function @(
     'Get-ApimAppliedPolicyViaRest', 'Get-ApimBaseUri', 'Get-ApimAccessToken',
     'New-ApimInstance', 'Invoke-ApimPromotion', 'Get-ApimInitialEnv',
     'Write-ApimConfigFile', 'Step-ApimConfigVersion', 'Set-ApimConfigVersion',
-    'Get-ApimConfigAtVersion', 'Get-ApimExchangeAssetSpec', 'Invoke-ApimSpecLint'
+    'Get-ApimConfigAtVersion', 'Get-ApimExchangeAssetSpec', 'Invoke-ApimSpecLint', 'ConvertTo-ApimSpecReportHtml'
 )

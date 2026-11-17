@@ -88,6 +88,12 @@ which rules are enforced, their severity, and which are this project's own polic
 on top of the standard (the per-classification severity tiering itself, and the verb/schema
 checks which are heuristics rather than exact clauses).
 
+Alongside the console `[spec]` lines, `validate-spec` also renders the findings as a
+colour-coded HTML scorecard (a severity donut + one card per standard category) via
+`ConvertTo-ApimSpecReportHtml`, written to `-ArtifactDir` as `<api>-<env>-spec-report.html`
+and published by the pipeline as the `spec-report-<env>` build artifact - open it from the
+run's **Summary > Related > Artifacts** for a readable view instead of scrolling the log.
+
 `validate-spec` needs an actual spec file (OAS/RAML/WSDL) attached to the Exchange asset -
 it has nothing to lint otherwise. A true spec-less Exchange "HTTP API" asset (no OAS/RAML/
 WSDL file at all) will make it fail with "has no files to validate". For that case only,
@@ -308,6 +314,7 @@ Against a real sandbox — copy `local/.env.example` to `local/.env`, fill it, t
 | &nbsp;&nbsp;`Invoke-AnypointCli` | run `anypoint-cli-v4`, capture JSON, surface errors |
 | &nbsp;&nbsp;`Get-ApimAccessToken` / `Invoke-ApimRest` / `Get-ApimAppliedPolicyViaRest` | REST read path (token + policies GET) |
 | &nbsp;&nbsp;`Get-ApimExchangeAssetSpec` / `Invoke-ApimSpecLint` | spec-validate: download the Exchange spec, lint it with Spectral against `spec-rules/` |
+| &nbsp;&nbsp;`ConvertTo-ApimSpecReportHtml` | renders `Invoke-ApimSpecLint`'s findings as a colour-coded scorecard (severity donut + one card per NZ Standard category) - written to `-ArtifactDir` by `validate-spec` as `<api>-<env>-spec-report.html` and published as the `spec-report-<env>` build artifact |
 | &nbsp;&nbsp;`Get-ApimInstanceId` / `New-ApimInstance` / `Invoke-ApimPromotion` / `Get-ApimAppliedPolicy` / `Add`/`Set`/`Remove-ApimPolicy` | CLI wrappers (`Get-ApimAppliedPolicy` = REST with CLI fallback) |
 | &nbsp;&nbsp;`Invoke-ApimReconcile` | orchestration: exists? → create/promote → apply plan → verify |
 | &nbsp;&nbsp;`Export-ApimConfig` | live policies (same REST read) → config-file `policies:` list; drops read-artifact keys, keeps/`CHANGE_ME`-stubs apply-only keys like jwt-validation `textKey` |

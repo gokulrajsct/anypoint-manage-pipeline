@@ -1037,6 +1037,52 @@ Describe 'Resolve-ApimPromotedInstanceId' {
     }
 }
 
+Describe 'ConvertTo-ApimSpecReportHtml' {
+    BeforeAll {
+        function New-Finding([string]$Code, [int]$Severity, [string[]]$Path, [string]$Message) {
+            [pscustomobject]@{ code = $Code; severity = $Severity; path = $Path; message = $Message }
+        }
+    }
+
+    It 'groups a known rule into its category, counts severities, and renders a finding' {
+        $findings = @(
+            (New-Finding 'nz-resource-path-lowercase' 0 @('paths', '/Orders') 'Path segments must be lower-case'),
+            (New-Finding 'nz-request-content-type-required' 1 @('paths', '/orders', 'post') 'No Content-Type declared')
+        )
+        $html = ConvertTo-ApimSpecReportHtml -Api 'orders-api' -Environment 'test' -Classification 'external' -LintResults $findings
+
+        $html | Should -Match 'Resource design'
+        $html | Should -Match 'HTTP requirements'
+        $html | Should -Match 'nz-resource-path-lowercase'
+        $html | Should -Match 'paths\./Orders'
+        $html | Should -Match '<div class="num">1</div>\s*<div class="lbl">error'
+        $html | Should -Match '<div class="num">1</div>\s*<div class="lbl">warn'
+    }
+
+    It 'buckets an unmapped rule code into "Other" instead of dropping it' {
+        $findings = @((New-Finding 'some-future-rule' 0 @('paths') 'A rule this report does not know about yet'))
+        $html = ConvertTo-ApimSpecReportHtml -Api 'orders-api' -Environment 'test' -Classification 'external' -LintResults $findings
+
+        $html | Should -Match '>Other<'
+        $html | Should -Match 'some-future-rule'
+    }
+
+    It 'shows an all-clear state and no category cards when there are no findings' {
+        $html = ConvertTo-ApimSpecReportHtml -Api 'orders-api' -Environment 'test' -Classification 'external' -LintResults @()
+
+        $html | Should -Match 'All clear'
+        $html | Should -Not -Match 'class="cat"'
+    }
+
+    It 'HTML-encodes a finding message so it cannot inject markup' {
+        $findings = @((New-Finding 'nz-resource-path-lowercase' 0 @('paths') 'Bad <script>alert(1)</script> & "quotes"'))
+        $html = ConvertTo-ApimSpecReportHtml -Api 'orders-api' -Environment 'test' -Classification 'external' -LintResults $findings
+
+        $html | Should -Not -Match '<script>alert'
+        $html | Should -Match '&lt;script&gt;'
+    }
+}
+
 Describe 'Export-ApimConfig (CLI mocked)' {
 
     It 'rewrites policies, preserves other sections, restores a masked secret' {

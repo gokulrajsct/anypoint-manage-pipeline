@@ -15,7 +15,7 @@
         'Get-ApimAppliedPolicyViaRest', 'Get-ApimBaseUri', 'Get-ApimAccessToken',
         'New-ApimInstance', 'Invoke-ApimPromotion', 'Get-ApimInitialEnv',
         'Write-ApimConfigFile', 'Step-ApimConfigVersion', 'Set-ApimConfigVersion',
-        'Get-ApimConfigAtVersion', 'Get-ApimExchangeAssetSpec', 'Invoke-ApimSpecLint'
+        'Get-ApimConfigAtVersion', 'Get-ApimExchangeAssetSpec', 'Invoke-ApimSpecLint', 'ConvertTo-ApimSpecReportHtml'
     )
     CmdletsToExport   = @()
     VariablesToExport = @()

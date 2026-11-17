@@ -84,7 +84,8 @@ jobs:
                 ./Invoke-ApimSync.ps1 -Action validate-spec `
                   -Environment "${{ parameters.environment }}" `
                   -ConfigDir "${{ parameters.configDir }}" `
-                  -Api "${{ parameters.apiKey }}"
+                  -Api "${{ parameters.apiKey }}" `
+                  -ArtifactDir "$(Build.ArtifactStagingDirectory)/spec-report"
               displayName: Validate API spec (NZ Govt API Standard)
               workingDirectory: ${{ parameters.pipelineDir }}
               env:
@@ -92,6 +93,11 @@ jobs:
                 ANYPOINT_CLIENT_SECRET: $(ANYPOINT_CLIENT_SECRET)
                 ANYPOINT_ORG: $(ANYPOINT_ORG)
                 ANYPOINT_HOST: $(ANYPOINT_HOST)
+
+            - publish: $(Build.ArtifactStagingDirectory)/spec-report
+              artifact: spec-report-${{ parameters.environment }}
+              displayName: Publish spec compliance scorecard
+              condition: succeededOrFailed()
 
             - pwsh: |
                 ./Invoke-ApimSync.ps1 -Action reconcile `

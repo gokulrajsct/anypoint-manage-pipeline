@@ -57,6 +57,7 @@ param(
     [ValidateSet('fromconfig', 'true', 'false')][string]$Prune = 'fromconfig',
     [string]$PlanOut,
     [string]$ArtifactDir,     # reconcile/redeploy: write <api>-<env>-v<version>.json here on a real change
+                               # validate-spec: write <api>-<env>-spec-report.html here always
     [string]$TargetVersion,   # redeploy: the configVersion to restore and reconcile
     [switch]$AllowDrift,
     [switch]$Commit,
@@ -197,6 +198,14 @@ try {
                 $lintResults = Invoke-ApimSpecLint -SpecFile $spec.Path -RulesetFile $rulesetFile
             }
             finally { Remove-Item -LiteralPath $specFile -ErrorAction SilentlyContinue }
+
+            if ($ArtifactDir) {
+                New-Item -ItemType Directory -Force -Path $ArtifactDir | Out-Null
+                $reportPath = Join-Path $ArtifactDir "$($c.Key)-$Environment-spec-report.html"
+                ConvertTo-ApimSpecReportHtml -Api $c.Key -Environment $Environment -Classification $classification `
+                    -LintResults $lintResults | Set-Content -LiteralPath $reportPath -Encoding utf8
+                Write-Host "[spec] report written: $reportPath"
+            }
 
             # A mismatch against the standard is a warning, not a pipeline failure - it's
             # surfaced loudly (console + an ADO warning annotation) but never blocks reconcile.
