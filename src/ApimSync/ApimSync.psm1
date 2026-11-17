@@ -1135,6 +1135,7 @@ function Invoke-ApimReconcile {
 
     if (-not $instanceId) {
         $how = Get-ApimCreateStrategy -CreateMode $CreateMode -Environment $Environment -Config $Config
+        $recoveredExisting = $false
         if ($how -eq 'promote') {
             $srcLogical = "$(Get-DictValue $Config.Promotion 'fromEnvironment')"
             $srcName = Resolve-ApimEnvironmentName $srcLogical
@@ -1147,7 +1148,18 @@ function Invoke-ApimReconcile {
             $result.Messages += "promote from $srcLogical/$srcLabel (instance $srcInstanceId, env $srcEnvId)"
             if (-not $DryRun) {
                 try { $instanceId = Invoke-ApimPromotion -TargetEnvName $envName -SourceInstanceId $srcInstanceId -SourceEnvId $srcEnvId -Config $Config }
-                catch { throw "PROMOTE failed for '$label' from '$srcLogical/$srcLabel' (source instance $srcInstanceId) into '$Environment': $($_.Exception.Message)" }
+                catch {
+                    # The check above (Get-ApimInstanceId) is supposed to catch an
+                    # already-existing target instance and skip promote entirely - if it
+                    # missed (e.g. a listing/filter quirk) and Anypoint itself now rejects
+                    # the promote as a duplicate, recover by looking it up directly instead
+                    # of failing on a condition that isn't actually a problem.
+                    $instanceId = Get-ApimInstanceId -EnvName $envName -InstanceLabel $label
+                    if (-not $instanceId) { throw "PROMOTE failed for '$label' from '$srcLogical/$srcLabel' (source instance $srcInstanceId) into '$Environment': $($_.Exception.Message)" }
+                    Write-Host "[promote] '$label' already existed in '$Environment' (missed by the earlier check) - found instance $instanceId; reconciling policies instead of promoting again."
+                    $result.Action = 'none'
+                    $recoveredExisting = $true
+                }
             }
         }
         else {
@@ -1155,11 +1167,23 @@ function Invoke-ApimReconcile {
             $result.Messages += "create instance '$label' from $($Config.ApiInstance.assetId):$($Config.ApiInstance.assetVersion)"
             if (-not $DryRun) {
                 try { $instanceId = New-ApimInstance -EnvName $envName -Config $Config }
-                catch { throw "CREATE failed for '$label' ($($Config.ApiInstance.assetId):$($Config.ApiInstance.assetVersion)) in '$Environment': $($_.Exception.Message)" }
+                catch {
+                    $instanceId = Get-ApimInstanceId -EnvName $envName -InstanceLabel $label
+                    if (-not $instanceId) { throw "CREATE failed for '$label' ($($Config.ApiInstance.assetId):$($Config.ApiInstance.assetVersion)) in '$Environment': $($_.Exception.Message)" }
+                    Write-Host "[create] '$label' already existed in '$Environment' (missed by the earlier check) - found instance $instanceId; reconciling policies instead of creating again."
+                    $result.Action = 'none'
+                    $recoveredExisting = $true
+                }
             }
         }
-        $result.Changed = $true
-        $liveRaw = if ($DryRun -or -not $instanceId) { @() } else { Get-ApimAppliedPolicy -EnvName $envName -InstanceId $instanceId }
+        if ($recoveredExisting) {
+            $result.Messages += "instance exists (id $instanceId)"
+            $liveRaw = Get-ApimAppliedPolicy -EnvName $envName -InstanceId $instanceId
+        }
+        else {
+            $result.Changed = $true
+            $liveRaw = if ($DryRun -or -not $instanceId) { @() } else { Get-ApimAppliedPolicy -EnvName $envName -InstanceId $instanceId }
+        }
     }
     else {
         $result.Messages += "instance exists (id $instanceId)"

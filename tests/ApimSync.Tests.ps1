@@ -972,6 +972,28 @@ Describe 'Invoke-ApimReconcile (dry run, CLI mocked)' {
         ($r.Messages -join ' ') | Should -BeLike '*555*'
         Should -Invoke -ModuleName ApimSync Invoke-ApimPromotion -Times 0
     }
+
+    It 'promote rejected as a duplicate (pre-check missed an existing target instance) -> recovers by looking it up, does not re-promote' {
+        $script:uatLookupCalls = 0
+        Mock -ModuleName ApimSync Get-ApimInstanceId {
+            param($EnvName, $InstanceLabel)
+            if ($InstanceLabel -ne 'orders-api-uat') { return '555' }   # source instance lookup
+            $script:uatLookupCalls++
+            if ($script:uatLookupCalls -eq 1) { return $null }          # initial pre-check: false negative
+            return '999'                                                # recovery lookup after Anypoint rejects the promote
+        }
+        Mock -ModuleName ApimSync Get-ApimEnvironmentId { 'ENV-TEST-ID' }
+        Mock -ModuleName ApimSync Get-ApimAppliedPolicy { @() }
+        Mock -ModuleName ApimSync Invoke-ApimPromotion { throw 'API Instance Label already exists for this Product Version in this Environment' }
+        Mock -ModuleName ApimSync Add-ApimPolicy {}
+        Mock -ModuleName ApimSync Assert-ApimConverged {}
+
+        $r = Invoke-ApimReconcile -Config $higherCfg -Environment uat -CreateMode auto
+        $r.Action     | Should -Be 'update'   # recovered the existing instance, then applied the still-pending policy diff
+        $r.InstanceId | Should -Be '999'
+        Should -Invoke -ModuleName ApimSync Invoke-ApimPromotion -Times 1
+        Should -Invoke -ModuleName ApimSync Get-ApimInstanceId -ParameterFilter { $InstanceLabel -eq 'orders-api-uat' } -Times 2
+    }
 }
 
 Describe 'Export-ApimConfig (CLI mocked)' {
