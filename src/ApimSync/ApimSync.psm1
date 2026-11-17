@@ -575,13 +575,16 @@ function Invoke-ApimPromotion {
         '--copyTiers', (& $b (Get-DictValue $p 'copyTiers')),
         '--copyAlerts', (& $b (Get-DictValue $p 'copyAlerts')),
         '--output', 'json')
-    $res = Invoke-AnypointCli -ArgumentList $args -AsJson
-    Set-ApimApiContext $res
-    # `api promote`'s JSON shape isn't guaranteed to be a flat {id: ...} the way `api manage`
-    # (create) is - try the field names we've actually seen before failing, and when none
-    # match, show the real response instead of a bare "property 'id' not found" crash.
-    $id = Get-FirstValue $res @('id', 'apiId', 'instanceId')
-    if (-not $id) { throw "api-mgr api promote did not return a recognizable instance id. Raw response: $($res | ConvertTo-Json -Depth 10 -Compress)" }
+    Invoke-AnypointCli -ArgumentList $args -AsJson | Out-Null
+    # `api promote`'s JSON response carries no instance id at all - just a human-readable
+    # confirmation message naming the SOURCE instance id (e.g. `API with ID "210040"
+    # promoted from "..." to "Bat"`). The promoted instance in $TargetEnvName gets its own,
+    # different id that this response never reports, so look it up by label afterward - the
+    # same way every other instance lookup in this module already works - instead of trying
+    # to parse an id field that doesn't exist.
+    $targetLabel = "$($Config.ApiInstance.instanceLabel)"
+    $id = Get-ApimInstanceId -EnvName $TargetEnvName -InstanceLabel $targetLabel
+    if (-not $id) { throw "Promoted into '$TargetEnvName' but could not find an instance labeled '$targetLabel' there afterwards." }
     return "$id"
 }
 
