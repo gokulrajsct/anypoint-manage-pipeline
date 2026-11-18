@@ -54,7 +54,8 @@ changing its pointcut is still a single in-place edit, not a remove-and-re-add.
 
 **Spec validation (NZ Government API Standard).** Before reconciling, the pipeline runs
 `action: validate-spec`: it downloads the Exchange spec for `apiInstance.assetId` /
-`assetVersion` and lints it with [Spectral](https://github.com/stoplightio/spectral)
+`assetVersion` (preferring `fat-oas`, then `oas`, then RAML, then WSDL - see
+`Get-ApimExchangeAssetSpec`) and lints it with [Spectral](https://github.com/stoplightio/spectral)
 against [`spec-rules/`](spec-rules), checking the rules in the
 [New Zealand Government API Standard](https://standards.digital.govt.nz/docref/api-standard/2026-09-01/en/)
 that are actually machine-checkable from an OpenAPI document — the standard has plenty of
@@ -93,6 +94,21 @@ colour-coded HTML scorecard (a severity donut + one card per standard category) 
 `ConvertTo-ApimSpecReportHtml`, written to `-ArtifactDir` as `<api>-<env>-spec-report.html`
 and published by the pipeline as the `spec-report-<env>` build artifact - open it from the
 run's **Summary > Related > Artifacts** for a readable view instead of scrolling the log.
+
+A `fat-oas`/`fat-raml` classifier in Exchange is always a zip bundle (it exists so a
+multi-file spec's `$ref`s resolve together) - `Get-ApimExchangeAssetSpec` detects this by
+sniffing the downloaded bytes for the zip signature, not by trusting the classifier name,
+and falls through to the next candidate (plain `oas`, then RAML, then WSDL) instead of
+handing Spectral a zip to lint as text. Feeding it binary data as YAML is what produces
+console noise like `ERROR parser at (root): The stream contains non-printable characters` -
+that's Spectral choking on bytes, not real findings against the standard.
+
+An environment whose config has the exact same `groupId`/`assetId`/`assetVersion` as the
+environment it promotes from (`promotion.fromEnvironment`) skips validate-spec entirely -
+that predecessor's own validate-spec stage (which runs first, in promotion order) already
+checked this exact spec, so re-downloading and re-linting an unchanged spec for every
+downstream environment is pure repeated work. It only re-validates once the asset version
+actually changes somewhere in the chain.
 
 `validate-spec` needs an actual spec file (OAS/RAML/WSDL) attached to the Exchange asset -
 it has nothing to lint otherwise. A true spec-less Exchange "HTTP API" asset (no OAS/RAML/

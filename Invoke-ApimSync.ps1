@@ -181,13 +181,36 @@ try {
                 exit 0
             }
 
+            $groupId = $c.ApiInstance.groupId
+            if (-not $groupId) { $groupId = Get-ApimOrgId }
+
+            # Same asset+version as the environment this one promotes from -> that
+            # environment's validate-spec stage already ran this exact check (stages run in
+            # promotion order), so re-downloading and re-linting an identical spec here is
+            # pure waste. Only the immediate predecessor needs checking: if it was itself a
+            # repeat of ITS predecessor, the spec hasn't changed anywhere further back
+            # either, and whichever stage last saw a real change already validated it.
+            $fromEnvLogical = "$($c.Promotion.fromEnvironment)"
+            if ($fromEnvLogical) {
+                try {
+                    $predecessor = @(Get-ApimConfigList -ConfigDir $ConfigDir -Api $Api -Environment $fromEnvLogical)[0]
+                    $predGroupId = $predecessor.ApiInstance.groupId
+                    if (-not $predGroupId) { $predGroupId = Get-ApimOrgId }
+                    if ($predecessor -and "$predGroupId" -eq "$groupId" -and
+                        "$($predecessor.ApiInstance.assetId)" -eq "$($c.ApiInstance.assetId)" -and
+                        "$($predecessor.ApiInstance.assetVersion)" -eq "$($c.ApiInstance.assetVersion)") {
+                        Write-Host "[spec] $($c.Key): skipping validate-spec - same asset $($c.ApiInstance.assetId)@$($c.ApiInstance.assetVersion) as '$fromEnvLogical', already validated there."
+                        exit 0
+                    }
+                }
+                catch { Write-Host "[spec] $($c.Key): could not check '$fromEnvLogical' for a redundant spec check ($($_.Exception.Message)) - validating anyway." }
+            }
+
             $classification = "$($c.ApiInstance.classification)"
             if (-not $classification) { $classification = 'public' }   # unset -> strictest tier
             $rulesetFile = Join-Path $PSScriptRoot "spec-rules/nz-api-standard.$classification.yaml"
             if (-not (Test-Path -LiteralPath $rulesetFile)) { throw "No ruleset for classification '$classification': $rulesetFile" }
 
-            $groupId = $c.ApiInstance.groupId
-            if (-not $groupId) { $groupId = Get-ApimOrgId }
             # .yaml extension even for an OAS file that's actually JSON - Spectral's parser
             # tries YAML first (which also reads valid JSON) regardless of file extension.
             $specFile = Join-Path ([System.IO.Path]::GetTempPath()) "$($c.Key)-$Environment-spec.yaml"

@@ -680,7 +680,13 @@ function Get-ApimExchangeAssetSpec {
     <# Download the primary spec file (OAS/RAML/WSDL) for an Exchange asset so it can be
        linted. Exchange asset identity (groupId/assetId/assetVersion) is the same triple
        apiInstance already carries - this is NOT the Anypoint Platform API Manager API,
-       it's the separate Exchange REST API. #>
+       it's the separate Exchange REST API.
+       A 'fat-oas'/'fat-raml' classifier is always a zip bundle in Exchange (it exists so a
+       multi-file spec's $refs can be resolved together) - Spectral lints one flat file, not
+       a zip, so downloading one straight to a .yaml path and linting it produces garbage
+       ("stream contains non-printable characters") instead of real findings. Detect that by
+       sniffing the actual bytes (the "PK" zip signature), not by trusting the classifier
+       name, and fall through to the next candidate instead. #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$GroupId,
@@ -694,21 +700,35 @@ function Get-ApimExchangeAssetSpec {
     if (-not $files) { throw "Exchange asset $GroupId/$AssetId/$AssetVersion has no files to validate" }
 
     # Prefer an API-spec classifier over other asset files (icons, examples, ...).
-    $file = $null
+    $candidates = @()
     foreach ($classifier in @('fat-oas', 'oas', 'fat-raml', 'raml', 'wsdl')) {
-        $file = $files | Where-Object { "$($_.classifier)" -eq $classifier } | Select-Object -First 1
-        if ($file) { break }
+        $candidates += @($files | Where-Object { "$($_.classifier)" -eq $classifier })
     }
-    if (-not $file) { $file = $files[0] }
-    if (-not $file.downloadURL) { throw "Exchange asset $GroupId/$AssetId/${AssetVersion}: spec file has no downloadURL" }
+    if (-not $candidates) { $candidates = @($files[0]) }
 
-    Write-Host "[spec] downloading '$($file.classifier)' spec for $AssetId@$AssetVersion"
-    # The asset-metadata GET above needs a bearer token; the file itself is behind the same
-    # auth unless the asset is flagged fully public in Exchange - send it here too, or a
-    # non-public asset's download comes back 401 even though the metadata call succeeded.
-    Invoke-WebRequest -Uri "$($file.downloadURL)" -OutFile $OutFile -UseBasicParsing `
-        -Headers @{ Authorization = "Bearer $(Get-ApimAccessToken)" } | Out-Null
-    return [pscustomobject]@{ Path = $OutFile; Classifier = "$($file.classifier)" }
+    $zipSkipped = @()
+    $noUrl = 0
+    foreach ($file in $candidates) {
+        if (-not $file.downloadURL) { $noUrl++; continue }
+        Write-Host "[spec] downloading '$($file.classifier)' spec for $AssetId@$AssetVersion"
+        # The asset-metadata GET above needs a bearer token; the file itself is behind the
+        # same auth unless the asset is flagged fully public in Exchange - send it here too,
+        # or a non-public asset's download comes back 401 even though the metadata call
+        # succeeded.
+        Invoke-WebRequest -Uri "$($file.downloadURL)" -OutFile $OutFile -UseBasicParsing `
+            -Headers @{ Authorization = "Bearer $(Get-ApimAccessToken)" } | Out-Null
+        $head = [System.IO.File]::ReadAllBytes($OutFile)
+        if ($head.Length -ge 2 -and $head[0] -eq 0x50 -and $head[1] -eq 0x4B) {
+            Write-Host "[spec] '$($file.classifier)' is a zip bundle (a 'fat' package resolving multiple files together) - this pipeline lints a single flat file, skipping it."
+            $zipSkipped += $file.classifier
+            continue
+        }
+        return [pscustomobject]@{ Path = $OutFile; Classifier = "$($file.classifier)" }
+    }
+    if ($zipSkipped) {
+        throw "Exchange asset $GroupId/$AssetId/${AssetVersion}: every spec file found is zip-packaged ($($zipSkipped -join ', ')) - attach a flat OAS/RAML file (not only a zip bundle) to validate, or set apiInstance.skipSpecValidation."
+    }
+    throw "Exchange asset $GroupId/$AssetId/${AssetVersion}: no candidate spec file has a downloadURL ($noUrl checked)"
 }
 
 function Invoke-ApimSpecLint {

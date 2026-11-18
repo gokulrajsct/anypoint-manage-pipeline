@@ -1037,6 +1037,78 @@ Describe 'Resolve-ApimPromotedInstanceId' {
     }
 }
 
+Describe 'Get-ApimExchangeAssetSpec' {
+    BeforeEach {
+        Mock -ModuleName ApimSync Get-ApimAccessToken { 'tok-123' }
+        Mock -ModuleName ApimSync Invoke-WebRequest {
+            param($Uri, $OutFile, $UseBasicParsing, $Headers)
+            Set-Content -LiteralPath $OutFile -Value "spec from $Uri"
+        }
+    }
+
+    It 'prefers fat-oas over oas over raml/wsdl when several are published' {
+        Mock -ModuleName ApimSync Invoke-ApimRest {
+            [pscustomobject]@{ files = @(
+                [pscustomobject]@{ classifier = 'oas'; downloadURL = 'https://x/oas' },
+                [pscustomobject]@{ classifier = 'fat-oas'; downloadURL = 'https://x/fat-oas' },
+                [pscustomobject]@{ classifier = 'icon'; downloadURL = 'https://x/icon' }
+            ) }
+        }
+        $out = Join-Path $TestDrive 'spec.yaml'
+        $spec = Get-ApimExchangeAssetSpec -GroupId g -AssetId orders-api -AssetVersion '1.0.0' -OutFile $out
+        $spec.Classifier | Should -Be 'fat-oas'
+        Test-Path -LiteralPath $spec.Path | Should -BeTrue
+    }
+
+    It 'skips a zip-packaged fat-oas (detected by content, not by classifier name) and falls through to plain oas' {
+        Mock -ModuleName ApimSync Invoke-ApimRest {
+            [pscustomobject]@{ files = @(
+                [pscustomobject]@{ classifier = 'fat-oas'; downloadURL = 'https://x/fat-oas.zip' },
+                [pscustomobject]@{ classifier = 'oas'; downloadURL = 'https://x/oas.yaml' }
+            ) }
+        }
+        Mock -ModuleName ApimSync Invoke-WebRequest {
+            param($Uri, $OutFile, $UseBasicParsing, $Headers)
+            if ($Uri -like '*.zip') { [System.IO.File]::WriteAllBytes($OutFile, [byte[]](0x50, 0x4B, 0x03, 0x04, 0x00, 0x00)) }
+            else { Set-Content -LiteralPath $OutFile -Value 'openapi: 3.0.0' }
+        }
+        $spec = Get-ApimExchangeAssetSpec -GroupId g -AssetId orders-api -AssetVersion '1.0.0' -OutFile (Join-Path $TestDrive 'spec-zip-skip.yaml')
+        $spec.Classifier | Should -Be 'oas'
+        Get-Content -LiteralPath $spec.Path -Raw | Should -Match 'openapi'
+    }
+
+    It 'throws a clear error when every candidate spec file is zip-packaged' {
+        Mock -ModuleName ApimSync Invoke-ApimRest {
+            [pscustomobject]@{ files = @([pscustomobject]@{ classifier = 'fat-oas'; downloadURL = 'https://x/fat-oas.zip' }) }
+        }
+        Mock -ModuleName ApimSync Invoke-WebRequest {
+            param($Uri, $OutFile, $UseBasicParsing, $Headers)
+            [System.IO.File]::WriteAllBytes($OutFile, [byte[]](0x50, 0x4B, 0x03, 0x04))
+        }
+        { Get-ApimExchangeAssetSpec -GroupId g -AssetId orders-api -AssetVersion '1.0.0' -OutFile (Join-Path $TestDrive 'spec-all-zip.yaml') } |
+            Should -Throw -ExpectedMessage '*zip-packaged*'
+    }
+
+    It 'falls back to raml when the asset has no OAS file at all' {
+        Mock -ModuleName ApimSync Invoke-ApimRest {
+            [pscustomobject]@{ files = @(
+                [pscustomobject]@{ classifier = 'raml'; downloadURL = 'https://x/raml' },
+                [pscustomobject]@{ classifier = 'wsdl'; downloadURL = 'https://x/wsdl' }
+            ) }
+        }
+        $spec = Get-ApimExchangeAssetSpec -GroupId g -AssetId orders-api -AssetVersion '1.0.0' -OutFile (Join-Path $TestDrive 'spec2.yaml')
+        $spec.Classifier | Should -Be 'raml'
+    }
+
+    It 'falls back to the first file when nothing matches a known spec classifier' {
+        Mock -ModuleName ApimSync Invoke-ApimRest {
+            [pscustomobject]@{ files = @([pscustomobject]@{ classifier = 'icon'; downloadURL = 'https://x/icon' }) }
+        }
+        $spec = Get-ApimExchangeAssetSpec -GroupId g -AssetId orders-api -AssetVersion '1.0.0' -OutFile (Join-Path $TestDrive 'spec3.yaml')
+        $spec.Classifier | Should -Be 'icon'
+    }
+}
+
 Describe 'ConvertTo-ApimSpecReportHtml' {
     BeforeAll {
         function New-Finding([string]$Code, [int]$Severity, [string[]]$Path, [string]$Message) {
