@@ -80,6 +80,11 @@ parameters:
     default: fromconfig
     values: [fromconfig, "true", "false"]
 
+  - name: runSpecValidation
+    displayName: Validate API spec against the NZ Govt API Standard (deploy only)
+    type: boolean
+    default: true
+
 resources:
   repositories:
     # `ref` and `trigger.branches.include` below both name the config repo's branch:
@@ -124,6 +129,7 @@ stages:
           dryRun: ${{ parameters.dryRun }}
           createMode: ${{ parameters.createMode }}
           prune: ${{ parameters.prune }}
+          runSpecValidation: ${{ parameters.runSpecValidation }}
           initialEnv: test
           pipelineDir: $(pipelineDir)
           configDir: "$(configRepoDir)"
@@ -143,6 +149,7 @@ stages:
           dryRun: ${{ parameters.dryRun }}
           createMode: ${{ parameters.createMode }}
           prune: ${{ parameters.prune }}
+          runSpecValidation: ${{ parameters.runSpecValidation }}
           initialEnv: test
           pipelineDir: $(pipelineDir)
           configDir: "$(configRepoDir)"
@@ -165,6 +172,7 @@ stages:
           dryRun: ${{ parameters.dryRun }}
           createMode: ${{ parameters.createMode }}
           prune: ${{ parameters.prune }}
+          runSpecValidation: ${{ parameters.runSpecValidation }}
           initialEnv: test
           pipelineDir: $(pipelineDir)
           configDir: "$(configRepoDir)"
@@ -184,6 +192,7 @@ stages:
           dryRun: ${{ parameters.dryRun }}
           createMode: ${{ parameters.createMode }}
           prune: ${{ parameters.prune }}
+          runSpecValidation: ${{ parameters.runSpecValidation }}
           initialEnv: test
           pipelineDir: $(pipelineDir)
           configDir: "$(configRepoDir)"

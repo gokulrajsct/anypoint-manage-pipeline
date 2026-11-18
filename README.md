@@ -110,6 +110,13 @@ checked this exact spec, so re-downloading and re-linting an unchanged spec for 
 downstream environment is pure repeated work. It only re-validates once the asset version
 actually changes somewhere in the chain.
 
+The queue-time `runSpecValidation` parameter (default `true`) is a separate, explicit
+opt-out: set it to `false` to skip validate-spec for every environment in that run entirely
+(e.g. a quick hotfix redeploy where you don't want to wait on spec linting at all). When
+`true`, the behavior above applies unchanged. This is compiled out at template-expansion
+time (`${{ if eq(parameters.runSpecValidation, true) }}`), so with it `false` the step - and
+its artifact-publish step - don't exist in the run at all, not merely skip at runtime.
+
 `validate-spec` needs an actual spec file (OAS/RAML/WSDL) attached to the Exchange asset -
 it has nothing to lint otherwise. A true spec-less Exchange "HTTP API" asset (no OAS/RAML/
 WSDL file at all) will make it fail with "has no files to validate". For that case only,

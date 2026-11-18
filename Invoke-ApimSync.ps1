@@ -176,6 +176,11 @@ try {
             Require-SingleApi $Api
             $c = @(Get-ApimConfigList -ConfigDir $ConfigDir -Api $Api -Environment $Environment)[0]
 
+            # Create $ArtifactDir unconditionally, even when validation is about to be
+            # skipped below - a pipeline step that publishes it as a build artifact would
+            # otherwise fail with "path does not exist" whenever this run skips validation.
+            if ($ArtifactDir) { New-Item -ItemType Directory -Force -Path $ArtifactDir | Out-Null }
+
             if ($c.ApiInstance.skipSpecValidation) {
                 Write-Host "##vso[task.logissue type=warning]$($c.Key): apiInstance.skipSpecValidation is true - skipping the NZ Government API Standard spec lint. This is a deliberate per-api opt-out (e.g. a spec-less Exchange 'HTTP API' asset); prefer attaching an OAS spec instead of leaving this set."
                 exit 0
@@ -223,7 +228,6 @@ try {
             finally { Remove-Item -LiteralPath $specFile -ErrorAction SilentlyContinue }
 
             if ($ArtifactDir) {
-                New-Item -ItemType Directory -Force -Path $ArtifactDir | Out-Null
                 $reportPath = Join-Path $ArtifactDir "$($c.Key)-$Environment-spec-report.html"
                 ConvertTo-ApimSpecReportHtml -Api $c.Key -Environment $Environment -Classification $classification `
                     -LintResults $lintResults | Set-Content -LiteralPath $reportPath -Encoding utf8
