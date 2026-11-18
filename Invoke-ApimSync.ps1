@@ -181,8 +181,33 @@ try {
             # otherwise fail with "path does not exist" whenever this run skips validation.
             if ($ArtifactDir) { New-Item -ItemType Directory -Force -Path $ArtifactDir | Out-Null }
 
+            function Write-ApimSpecSkipNotice([string]$Reason) {
+                # A skip still writes something into the artifact - an empty published
+                # folder looks like something broke, not like a deliberate skip.
+                if (-not $ArtifactDir) { return }
+                $reportPath = Join-Path $ArtifactDir "$($c.Key)-$Environment-spec-report.html"
+                $enc = [System.Net.WebUtility]::HtmlEncode($Reason)
+                @"
+<meta name="claude:viewport-fit-sides" content="cover">
+<title>$($c.Key) spec compliance</title>
+<style>
+:root{--bg:#f4f5f3;--fg:#171a21;--muted:#6b7280;--card:#ffffff;--line:#e4e4df;color-scheme:light}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#13151b;--fg:#eceef2;--muted:#9298a8;--card:#1a1d25;--line:#2a2d38;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#13151b;--fg:#eceef2;--muted:#9298a8;--card:#1a1d25;--line:#2a2d38;color-scheme:dark}
+body{background:var(--bg);color:var(--fg);font-family:Arial,sans-serif;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+.card{max-width:640px;margin:64px auto;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:32px}
+</style>
+<div class="card">
+<h2>Spec validation skipped</h2>
+<p>$enc</p>
+</div>
+"@ | Set-Content -LiteralPath $reportPath -Encoding utf8
+                Write-Host "[spec] skip notice written: $reportPath"
+            }
+
             if ($c.ApiInstance.skipSpecValidation) {
                 Write-Host "##vso[task.logissue type=warning]$($c.Key): apiInstance.skipSpecValidation is true - skipping the NZ Government API Standard spec lint. This is a deliberate per-api opt-out (e.g. a spec-less Exchange 'HTTP API' asset); prefer attaching an OAS spec instead of leaving this set."
+                Write-ApimSpecSkipNotice "apiInstance.skipSpecValidation is true for $($c.Key)/$Environment - the NZ Government API Standard check was not run."
                 exit 0
             }
 
@@ -205,6 +230,7 @@ try {
                         "$($predecessor.ApiInstance.assetId)" -eq "$($c.ApiInstance.assetId)" -and
                         "$($predecessor.ApiInstance.assetVersion)" -eq "$($c.ApiInstance.assetVersion)") {
                         Write-Host "[spec] $($c.Key): skipping validate-spec - same asset $($c.ApiInstance.assetId)@$($c.ApiInstance.assetVersion) as '$fromEnvLogical', already validated there."
+                        Write-ApimSpecSkipNotice "Same asset $($c.ApiInstance.assetId)@$($c.ApiInstance.assetVersion) as '$fromEnvLogical' - already validated there (see that environment's spec-report artifact). Nothing re-checked here."
                         exit 0
                     }
                 }

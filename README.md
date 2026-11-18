@@ -108,7 +108,9 @@ environment it promotes from (`promotion.fromEnvironment`) skips validate-spec e
 that predecessor's own validate-spec stage (which runs first, in promotion order) already
 checked this exact spec, so re-downloading and re-linting an unchanged spec for every
 downstream environment is pure repeated work. It only re-validates once the asset version
-actually changes somewhere in the chain.
+actually changes somewhere in the chain. Every skip (this one, or `skipSpecValidation`)
+still writes a short notice into the `spec-report-<env>` artifact explaining why, rather
+than leaving the published artifact folder empty with no explanation.
 
 The queue-time `runSpecValidation` parameter (default `true`) is a separate, explicit
 opt-out: set it to `false` to skip validate-spec for every environment in that run entirely
