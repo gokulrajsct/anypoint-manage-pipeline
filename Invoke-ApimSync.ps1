@@ -181,12 +181,13 @@ try {
             # otherwise fail with "path does not exist" whenever this run skips validation.
             if ($ArtifactDir) { New-Item -ItemType Directory -Force -Path $ArtifactDir | Out-Null }
 
-            function Write-ApimSpecSkipNotice([string]$Reason) {
-                # A skip still writes something into the artifact - an empty published
+            function Write-ApimSpecSkipNotice([string]$Reason, [string]$Heading = 'Spec validation skipped') {
+                # A skip/failure still writes something into the artifact - an empty published
                 # folder looks like something broke, not like a deliberate skip.
                 if (-not $ArtifactDir) { return }
                 $reportPath = Join-Path $ArtifactDir "$($c.Key)-$Environment-spec-report.html"
                 $enc = [System.Net.WebUtility]::HtmlEncode($Reason)
+                $encHeading = [System.Net.WebUtility]::HtmlEncode($Heading)
                 @"
 <meta name="claude:viewport-fit-sides" content="cover">
 <title>$($c.Key) spec compliance</title>
@@ -198,11 +199,11 @@ body{background:var(--bg);color:var(--fg);font-family:Arial,sans-serif;padding-l
 .card{max-width:640px;margin:64px auto;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:32px}
 </style>
 <div class="card">
-<h2>Spec validation skipped</h2>
+<h2>$encHeading</h2>
 <p>$enc</p>
 </div>
 "@ | Set-Content -LiteralPath $reportPath -Encoding utf8
-                Write-Host "[spec] skip notice written: $reportPath"
+                Write-Host "[spec] notice written: $reportPath"
             }
 
             if ($c.ApiInstance.skipSpecValidation) {
@@ -211,40 +212,55 @@ body{background:var(--bg);color:var(--fg);font-family:Arial,sans-serif;padding-l
                 exit 0
             }
 
-            $groupId = $c.ApiInstance.groupId
-            if (-not $groupId) { $groupId = Get-ApimOrgId }
-
-            $classification = "$($c.ApiInstance.classification)"
-            if (-not $classification) { $classification = 'public' }   # unset -> strictest tier
-            $rulesetFile = Join-Path $PSScriptRoot "spec-rules/nz-api-standard.$classification.yaml"
-            if (-not (Test-Path -LiteralPath $rulesetFile)) { throw "No ruleset for classification '$classification': $rulesetFile" }
-
-            # .yaml extension even for an OAS file that's actually JSON - Spectral's parser
-            # tries YAML first (which also reads valid JSON) regardless of file extension.
-            $specFile = Join-Path ([System.IO.Path]::GetTempPath()) "$($c.Key)-$Environment-spec.yaml"
-            $spec = Get-ApimExchangeAssetSpec -GroupId $groupId -AssetId $c.ApiInstance.assetId `
-                -AssetVersion $c.ApiInstance.assetVersion -OutFile $specFile
-            Write-Host "[spec] $($c.Key): classification=$classification ruleset=nz-api-standard.$classification.yaml spec=$($spec.Classifier)"
+            # Spec compliance is advisory, end to end: a lint FINDING never blocks reconcile
+            # (see the warning annotation below), and neither should a failure of the check
+            # itself - Exchange being unreachable, an unparseable/zip-only spec, spectral
+            # missing, etc. Without this try/catch, any such failure throws out of this
+            # action, the script's catch block exits non-zero, and the pipeline job stops
+            # before the Reconcile step ever runs - gating a real deployment on a spec-tooling
+            # problem that has nothing to do with the policies being applied.
             try {
-                $lintResults = Invoke-ApimSpecLint -SpecFile $spec.Path -RulesetFile $rulesetFile
-            }
-            finally { Remove-Item -LiteralPath $specFile -ErrorAction SilentlyContinue }
+                $groupId = $c.ApiInstance.groupId
+                if (-not $groupId) { $groupId = Get-ApimOrgId }
 
-            if ($ArtifactDir) {
-                $reportPath = Join-Path $ArtifactDir "$($c.Key)-$Environment-spec-report.html"
-                ConvertTo-ApimSpecReportHtml -Api $c.Key -Environment $Environment -Classification $classification `
-                    -LintResults $lintResults | Set-Content -LiteralPath $reportPath -Encoding utf8
-                Write-Host "[spec] report written: $reportPath"
-            }
+                $classification = "$($c.ApiInstance.classification)"
+                if (-not $classification) { $classification = 'public' }   # unset -> strictest tier
+                $rulesetFile = Join-Path $PSScriptRoot "spec-rules/nz-api-standard.$classification.yaml"
+                if (-not (Test-Path -LiteralPath $rulesetFile)) { throw "No ruleset for classification '$classification': $rulesetFile" }
 
-            # A mismatch against the standard is a warning, not a pipeline failure - it's
-            # surfaced loudly (console + an ADO warning annotation) but never blocks reconcile.
-            $specErrors = @($lintResults | Where-Object { [int]$_.severity -eq 0 })
-            if ($specErrors.Count -gt 0) {
-                Write-Host "##vso[task.logissue type=warning]$($c.Key): $($specErrors.Count) finding(s) against the NZ Government API Standard ($classification tier) - see [spec] lines above. Not blocking the pipeline."
+                # .yaml extension even for an OAS file that's actually JSON - Spectral's parser
+                # tries YAML first (which also reads valid JSON) regardless of file extension.
+                $specFile = Join-Path ([System.IO.Path]::GetTempPath()) "$($c.Key)-$Environment-spec.yaml"
+                $spec = Get-ApimExchangeAssetSpec -GroupId $groupId -AssetId $c.ApiInstance.assetId `
+                    -AssetVersion $c.ApiInstance.assetVersion -OutFile $specFile
+                Write-Host "[spec] $($c.Key): classification=$classification ruleset=nz-api-standard.$classification.yaml spec=$($spec.Classifier)"
+                try {
+                    $lintResults = Invoke-ApimSpecLint -SpecFile $spec.Path -RulesetFile $rulesetFile
+                }
+                finally { Remove-Item -LiteralPath $specFile -ErrorAction SilentlyContinue }
+
+                if ($ArtifactDir) {
+                    $reportPath = Join-Path $ArtifactDir "$($c.Key)-$Environment-spec-report.html"
+                    ConvertTo-ApimSpecReportHtml -Api $c.Key -Environment $Environment -Classification $classification `
+                        -LintResults $lintResults | Set-Content -LiteralPath $reportPath -Encoding utf8
+                    Write-Host "[spec] report written: $reportPath"
+                }
+
+                # A mismatch against the standard is a warning, not a pipeline failure - it's
+                # surfaced loudly (console + an ADO warning annotation) but never blocks reconcile.
+                $specErrors = @($lintResults | Where-Object { [int]$_.severity -eq 0 })
+                if ($specErrors.Count -gt 0) {
+                    Write-Host "##vso[task.logissue type=warning]$($c.Key): $($specErrors.Count) finding(s) against the NZ Government API Standard ($classification tier) - see [spec] lines above. Not blocking the pipeline."
+                }
+                else {
+                    Write-Host "Spec OK against the NZ Government API Standard ($classification tier)."
+                }
             }
-            else {
-                Write-Host "Spec OK against the NZ Government API Standard ($classification tier)."
+            catch {
+                Write-Host "[spec] ERROR $($_.Exception.Message)"
+                Write-Host "##vso[task.logissue type=warning]$($c.Key): spec validation could not run ($($_.Exception.Message)) - not blocking the pipeline."
+                Write-ApimSpecSkipNotice -Heading 'Spec validation failed' `
+                    -Reason "The NZ Government API Standard check for $($c.Key)/$Environment did not complete: $($_.Exception.Message)"
             }
             exit 0
         }
