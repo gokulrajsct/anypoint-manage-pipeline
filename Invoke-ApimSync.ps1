@@ -214,29 +214,6 @@ body{background:var(--bg);color:var(--fg);font-family:Arial,sans-serif;padding-l
             $groupId = $c.ApiInstance.groupId
             if (-not $groupId) { $groupId = Get-ApimOrgId }
 
-            # Same asset+version as the environment this one promotes from -> that
-            # environment's validate-spec stage already ran this exact check (stages run in
-            # promotion order), so re-downloading and re-linting an identical spec here is
-            # pure waste. Only the immediate predecessor needs checking: if it was itself a
-            # repeat of ITS predecessor, the spec hasn't changed anywhere further back
-            # either, and whichever stage last saw a real change already validated it.
-            $fromEnvLogical = "$($c.Promotion.fromEnvironment)"
-            if ($fromEnvLogical) {
-                try {
-                    $predecessor = @(Get-ApimConfigList -ConfigDir $ConfigDir -Api $Api -Environment $fromEnvLogical)[0]
-                    $predGroupId = $predecessor.ApiInstance.groupId
-                    if (-not $predGroupId) { $predGroupId = Get-ApimOrgId }
-                    if ($predecessor -and "$predGroupId" -eq "$groupId" -and
-                        "$($predecessor.ApiInstance.assetId)" -eq "$($c.ApiInstance.assetId)" -and
-                        "$($predecessor.ApiInstance.assetVersion)" -eq "$($c.ApiInstance.assetVersion)") {
-                        Write-Host "[spec] $($c.Key): skipping validate-spec - same asset $($c.ApiInstance.assetId)@$($c.ApiInstance.assetVersion) as '$fromEnvLogical', already validated there."
-                        Write-ApimSpecSkipNotice "Same asset $($c.ApiInstance.assetId)@$($c.ApiInstance.assetVersion) as '$fromEnvLogical' - already validated there (see that environment's spec-report artifact). Nothing re-checked here."
-                        exit 0
-                    }
-                }
-                catch { Write-Host "[spec] $($c.Key): could not check '$fromEnvLogical' for a redundant spec check ($($_.Exception.Message)) - validating anyway." }
-            }
-
             $classification = "$($c.ApiInstance.classification)"
             if (-not $classification) { $classification = 'public' }   # unset -> strictest tier
             $rulesetFile = Join-Path $PSScriptRoot "spec-rules/nz-api-standard.$classification.yaml"

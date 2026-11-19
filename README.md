@@ -103,21 +103,20 @@ handing Spectral a zip to lint as text. Feeding it binary data as YAML is what p
 console noise like `ERROR parser at (root): The stream contains non-printable characters` -
 that's Spectral choking on bytes, not real findings against the standard.
 
-An environment whose config has the exact same `groupId`/`assetId`/`assetVersion` as the
-environment it promotes from (`promotion.fromEnvironment`) skips validate-spec entirely -
-that predecessor's own validate-spec stage (which runs first, in promotion order) already
-checked this exact spec, so re-downloading and re-linting an unchanged spec for every
-downstream environment is pure repeated work. It only re-validates once the asset version
-actually changes somewhere in the chain. Every skip (this one, or `skipSpecValidation`)
-still writes a short notice into the `spec-report-<env>` artifact explaining why, rather
-than leaving the published artifact folder empty with no explanation.
-
-The queue-time `runSpecValidation` parameter (default `true`) is a separate, explicit
-opt-out: set it to `false` to skip validate-spec for every environment in that run entirely
-(e.g. a quick hotfix redeploy where you don't want to wait on spec linting at all). When
-`true`, the behavior above applies unchanged. This is compiled out at template-expansion
-time (`${{ if eq(parameters.runSpecValidation, true) }}`), so with it `false` the step - and
-its artifact-publish step - don't exist in the run at all, not merely skip at runtime.
+The queue-time `runSpecValidation` parameter (default `true`) is the only way validate-spec
+gets skipped based on something other than the config itself: set it to `false` to skip it
+for every environment in that run (e.g. a quick hotfix redeploy where you don't want to
+wait on spec linting at all). There is deliberately no other automatic skip - every
+environment that runs validate-spec actually downloads and lints its spec every time, even
+if an earlier environment in the promotion chain has the identical asset version, so
+"I asked it to validate" always means it validates. `runSpecValidation: false` is compiled
+out at template-expansion time (`${{ if eq(parameters.runSpecValidation, true) }}`), so with
+it `false` the step - and its artifact-publish step - don't exist in the run at all, so
+there's no `spec-report-<env>` artifact published for that environment either (no step, no
+empty-folder problem). `apiInstance.skipSpecValidation` (below) is the one other,
+per-api, config-driven way to skip - unlike `runSpecValidation: false`, that one still runs
+the step (it decides to skip only after loading the config), so it writes a short notice
+into the `spec-report-<env>` artifact explaining why, rather than leaving it empty.
 
 `validate-spec` needs an actual spec file (OAS/RAML/WSDL) attached to the Exchange asset -
 it has nothing to lint otherwise. A true spec-less Exchange "HTTP API" asset (no OAS/RAML/
