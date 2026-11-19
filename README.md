@@ -95,13 +95,19 @@ colour-coded HTML scorecard (a severity donut + one card per standard category) 
 and published by the pipeline as the `spec-report-<env>` build artifact - open it from the
 run's **Summary > Related > Artifacts** for a readable view instead of scrolling the log.
 
-A `fat-oas`/`fat-raml` classifier in Exchange is always a zip bundle (it exists so a
-multi-file spec's `$ref`s resolve together) - `Get-ApimExchangeAssetSpec` detects this by
-sniffing the downloaded bytes for the zip signature, not by trusting the classifier name,
-and falls through to the next candidate (plain `oas`, then RAML, then WSDL) instead of
-handing Spectral a zip to lint as text. Feeding it binary data as YAML is what produces
-console noise like `ERROR parser at (root): The stream contains non-printable characters` -
-that's Spectral choking on bytes, not real findings against the standard.
+Any classifier can come back zip-packaged in Exchange, not only `fat-oas`/`fat-raml` - a
+multi-file spec (one with `$ref`'d schema fragments) makes even the plain `oas`/`raml`
+classifier a zip, since there's no other way to ship more than one file. `Get-ApimExchangeAssetSpec`
+detects this by sniffing the downloaded bytes for the zip signature, not by trusting the
+classifier name, then extracts it and resolves its entry file
+(`Resolve-ApimSpecZipEntry`) - via the file metadata's `mainFile`/`main` property, falling
+back to the zip's own `exchange.json` manifest, then to the only spec-shaped file at its
+root - instead of handing Spectral the zip to lint as text. Feeding it binary data as YAML
+is what produces console noise like
+`ERROR parser at (root): The stream contains non-printable characters` - that's Spectral
+choking on bytes, not real findings against the standard. Only when a zip's entry file truly
+can't be identified does it fall through to the next candidate, or fail with a clear error
+naming every classifier it tried.
 
 The queue-time `runSpecValidation` parameter (default `true`) is the only way validate-spec
 gets skipped based on something other than the config itself: set it to `false` to skip it
@@ -337,7 +343,7 @@ Against a real sandbox — copy `local/.env.example` to `local/.env`, fill it, t
 | &nbsp;&nbsp;`Get-ApimPolicyPlan` | desired vs live → Add / Edit / Remove / Toggle / Drift plan |
 | &nbsp;&nbsp;`Invoke-AnypointCli` | run `anypoint-cli-v4`, capture JSON, surface errors |
 | &nbsp;&nbsp;`Get-ApimAccessToken` / `Invoke-ApimRest` / `Get-ApimAppliedPolicyViaRest` | REST read path (token + policies GET) |
-| &nbsp;&nbsp;`Get-ApimExchangeAssetSpec` / `Invoke-ApimSpecLint` | spec-validate: download the Exchange spec, lint it with Spectral against `spec-rules/` |
+| &nbsp;&nbsp;`Get-ApimExchangeAssetSpec` / `Resolve-ApimSpecZipEntry` / `Invoke-ApimSpecLint` | spec-validate: download the Exchange spec (extracting + resolving the entry file if it's zip-packaged), lint it with Spectral against `spec-rules/` |
 | &nbsp;&nbsp;`ConvertTo-ApimSpecReportHtml` | renders `Invoke-ApimSpecLint`'s findings as a colour-coded scorecard (severity donut + one card per NZ Standard category) - written to `-ArtifactDir` by `validate-spec` as `<api>-<env>-spec-report.html` and published as the `spec-report-<env>` build artifact |
 | &nbsp;&nbsp;`Get-ApimInstanceId` / `New-ApimInstance` / `Invoke-ApimPromotion` / `Get-ApimAppliedPolicy` / `Add`/`Set`/`Remove-ApimPolicy` | CLI wrappers (`Get-ApimAppliedPolicy` = REST with CLI fallback) |
 | &nbsp;&nbsp;`Invoke-ApimReconcile` | orchestration: exists? → create/promote → apply plan → verify |

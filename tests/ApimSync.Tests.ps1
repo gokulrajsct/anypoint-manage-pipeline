@@ -1060,7 +1060,7 @@ Describe 'Get-ApimExchangeAssetSpec' {
         Test-Path -LiteralPath $spec.Path | Should -BeTrue
     }
 
-    It 'skips a zip-packaged fat-oas (detected by content, not by classifier name) and falls through to plain oas' {
+    It 'falls through a zip-packaged fat-oas that cannot be extracted (detected by content, not by classifier name) to plain oas' {
         Mock -ModuleName ApimSync Invoke-ApimRest {
             [pscustomobject]@{ files = @(
                 [pscustomobject]@{ classifier = 'fat-oas'; downloadURL = 'https://x/fat-oas.zip' },
@@ -1069,6 +1069,7 @@ Describe 'Get-ApimExchangeAssetSpec' {
         }
         Mock -ModuleName ApimSync Invoke-WebRequest {
             param($Uri, $OutFile, $UseBasicParsing, $Headers)
+            # A real zip signature but truncated/invalid content - simulates a zip Expand-Archive can't open.
             if ($Uri -like '*.zip') { [System.IO.File]::WriteAllBytes($OutFile, [byte[]](0x50, 0x4B, 0x03, 0x04, 0x00, 0x00)) }
             else { Set-Content -LiteralPath $OutFile -Value 'openapi: 3.0.0' }
         }
@@ -1077,7 +1078,69 @@ Describe 'Get-ApimExchangeAssetSpec' {
         Get-Content -LiteralPath $spec.Path -Raw | Should -Match 'openapi'
     }
 
-    It 'throws a clear error when every candidate spec file is zip-packaged' {
+    It 'extracts a zip-packaged spec and resolves its entry file via the file metadata''s mainFile' {
+        $srcDir = Join-Path $TestDrive 'src-mainfile'
+        New-Item -ItemType Directory -Path $srcDir | Out-Null
+        Set-Content -LiteralPath (Join-Path $srcDir 'api.yaml') -Value 'openapi: 3.0.0'
+        Set-Content -LiteralPath (Join-Path $srcDir 'schemas.yaml') -Value 'components: {}'
+        $zipPath = Join-Path $TestDrive 'bundle-mainfile.zip'
+        Compress-Archive -Path (Join-Path $srcDir '*') -DestinationPath $zipPath
+
+        Mock -ModuleName ApimSync Invoke-ApimRest {
+            [pscustomobject]@{ files = @(
+                [pscustomobject]@{ classifier = 'fat-oas'; downloadURL = 'https://x/fat-oas'; mainFile = 'api.yaml' }
+            ) }
+        }
+        Mock -ModuleName ApimSync Invoke-WebRequest {
+            param($Uri, $OutFile, $UseBasicParsing, $Headers)
+            Copy-Item -LiteralPath $zipPath -Destination $OutFile -Force
+        }
+        $spec = Get-ApimExchangeAssetSpec -GroupId g -AssetId orders-api -AssetVersion '1.0.0' -OutFile (Join-Path $TestDrive 'spec-extract-main.yaml')
+        $spec.Classifier | Should -Be 'fat-oas'
+        Get-Content -LiteralPath $spec.Path -Raw | Should -Match 'openapi'
+        Split-Path -Leaf $spec.Path | Should -Be 'api.yaml'
+    }
+
+    It 'extracts a zip and resolves its entry file via the exchange.json manifest when the file metadata has no mainFile' {
+        $srcDir = Join-Path $TestDrive 'src-manifest'
+        New-Item -ItemType Directory -Path $srcDir | Out-Null
+        Set-Content -LiteralPath (Join-Path $srcDir 'exchange.json') -Value '{"main":"root.raml"}'
+        Set-Content -LiteralPath (Join-Path $srcDir 'root.raml') -Value '#%RAML 1.0'
+        $zipPath = Join-Path $TestDrive 'bundle-manifest.zip'
+        Compress-Archive -Path (Join-Path $srcDir '*') -DestinationPath $zipPath
+
+        Mock -ModuleName ApimSync Invoke-ApimRest {
+            [pscustomobject]@{ files = @([pscustomobject]@{ classifier = 'raml'; downloadURL = 'https://x/raml' }) }
+        }
+        Mock -ModuleName ApimSync Invoke-WebRequest {
+            param($Uri, $OutFile, $UseBasicParsing, $Headers)
+            Copy-Item -LiteralPath $zipPath -Destination $OutFile -Force
+        }
+        $spec = Get-ApimExchangeAssetSpec -GroupId g -AssetId orders-api -AssetVersion '1.0.0' -OutFile (Join-Path $TestDrive 'spec-extract-manifest.yaml')
+        $spec.Classifier | Should -Be 'raml'
+        Get-Content -LiteralPath $spec.Path -Raw | Should -Match 'RAML'
+    }
+
+    It 'extracts a zip and falls back to the single spec-shaped root file when nothing names the entry file' {
+        $srcDir = Join-Path $TestDrive 'src-fallback'
+        New-Item -ItemType Directory -Path $srcDir | Out-Null
+        Set-Content -LiteralPath (Join-Path $srcDir 'only.yaml') -Value 'openapi: 3.0.0'
+        $zipPath = Join-Path $TestDrive 'bundle-fallback.zip'
+        Compress-Archive -Path (Join-Path $srcDir '*') -DestinationPath $zipPath
+
+        Mock -ModuleName ApimSync Invoke-ApimRest {
+            [pscustomobject]@{ files = @([pscustomobject]@{ classifier = 'oas'; downloadURL = 'https://x/oas' }) }
+        }
+        Mock -ModuleName ApimSync Invoke-WebRequest {
+            param($Uri, $OutFile, $UseBasicParsing, $Headers)
+            Copy-Item -LiteralPath $zipPath -Destination $OutFile -Force
+        }
+        $spec = Get-ApimExchangeAssetSpec -GroupId g -AssetId orders-api -AssetVersion '1.0.0' -OutFile (Join-Path $TestDrive 'spec-extract-fallback.yaml')
+        $spec.Classifier | Should -Be 'oas'
+        Get-Content -LiteralPath $spec.Path -Raw | Should -Match 'openapi'
+    }
+
+    It 'throws a clear error when every candidate spec file is a zip with no identifiable entry file' {
         Mock -ModuleName ApimSync Invoke-ApimRest {
             [pscustomobject]@{ files = @([pscustomobject]@{ classifier = 'fat-oas'; downloadURL = 'https://x/fat-oas.zip' }) }
         }
@@ -1086,7 +1149,7 @@ Describe 'Get-ApimExchangeAssetSpec' {
             [System.IO.File]::WriteAllBytes($OutFile, [byte[]](0x50, 0x4B, 0x03, 0x04))
         }
         { Get-ApimExchangeAssetSpec -GroupId g -AssetId orders-api -AssetVersion '1.0.0' -OutFile (Join-Path $TestDrive 'spec-all-zip.yaml') } |
-            Should -Throw -ExpectedMessage '*zip-packaged*'
+            Should -Throw -ExpectedMessage '*no identifiable entry file*'
     }
 
     It 'falls back to raml when the asset has no OAS file at all' {
